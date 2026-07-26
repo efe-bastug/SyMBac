@@ -18,39 +18,10 @@ number is quoted inline. Two Chromatix docstrings were found to contradict their
 implementation (`spectrally_modulate_phase` and `init_plane_resample`); in both cases this
 document follows the implementation and says so explicitly.
 
-## Corrections to the previous revision
-
-The previous revision was written from signatures and docstrings. Executing the pinned tree
-invalidated four of its claims and resolved three of its open questions. Both lists are given
-here so that a reviewer who read the earlier draft can see exactly what moved.
-
-**Claims withdrawn as incorrect:**
-
-| Previous claim | What the pinned tree actually does | Reference |
-| :--- | :--- | :--- |
-| The `NA` argument of `high_na_ff_lens` acts as an aperture stop, truncating light beyond `objective_na`. | It does not truncate. The mask only clamps the angle; light outside the pupil passes through as if at normal incidence. Measured 0.55 maximum relative difference against a run with an explicit `circular_pupil`. An explicit aperture-stop step is now part of the pipeline. | [cartesian_to_spherical](https://chromatix.readthedocs.io/en/latest/api/field/#chromatix.core.field.cartesian_to_spherical), `field.py:918-921` |
-| In the specimen-free run, total power at the camera equals total launched power (V7(b)). | `high_na_ff_lens` is not power preserving and its scaling depends on `output_dx`: measured ratios of 18.2 and 72.3. V7(b) is now restricted to the `plane_wave` plus `ff_lens` sub-chain, which is conserving to `1e-7`. | [high_na_ff_lens](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.lenses.high_na_ff_lens), `lenses.py:145-154` |
-| `high_na_ff_lens` "computes an internal defocus correction of its own, so the two must not be applied twice." | The variable named `defocus` is the fixed-`f` propagation phase and obliquity Jacobian at `z = f`. A user defocus composes with it multiplicatively. The double-count risk lies elsewhere and V4 was rewritten accordingly. | [high_na_ff_lens](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.lenses.high_na_ff_lens), `lenses.py:145` |
-| The `spectrally_modulate` factor is "the ratio of each wavelength to the central wavelength", as the Chromatix docstring states. | The implementation returns the reciprocal, `central_wavelength / wavelength`. The docstring is wrong. Measured `[1.0000, 1.1822, 0.8185]` for `[0.532, 0.450, 0.650] um`. | [Spectrum.spectral_modulation](https://chromatix.readthedocs.io/en/latest/api/core/#chromatix.core.spectrum.Spectrum.spectral_modulation), `spectrum.py:97-103` |
-
-Note that in all four rows the published documentation page renders the **docstring**, which is
-either silent on the point or actively wrong. That is the reason this document cites source
-lines alongside every documentation link rather than relying on the published pages alone.
-
-**Open questions closed by inspection or measurement:**
-
-| Previously open | Now |
-| :--- | :--- |
-| The `kykx` mapping "is a proposed convention, not yet independently verified". | Verified: phase residual `1.2e-6` across three test directions, with `NA_y` on axis 0. V11 becomes a regression guard. |
-| V12 must determine "which direction of the ratio Chromatix applies". | Determined statically from `Spectrum.spectral_modulation`. V12 becomes a regression guard. |
-| **[Gate]** on whether `resize_amount` must be constrained so `bin_factor` is an integer. | Withdrawn. Chromatix's `init_plane_resample` already handles the non-integer case with correct photon accounting. Integer remains preferable, so the implementation warns rather than errors. |
-
-**Newly identified, not present in the previous revision at all:** `high_na_ff_lens` rejects
-polychromatic fields outright; the camera-plane sample spacing is imposed by the lens rather
-than chosen; the aplanatic `sqrt(cos theta)` apodisation is absent from Chromatix's transfer
-matrix; `init_plane_resample` silently ignores the spelling `"pooling"`; the Chromatix and
-SyMBac Python constraints intersect at exactly 3.12; and `E_z` is populated at order `NA`
-rather than being "numerically zero".
+Where a measured value contradicts what the published documentation page states, the
+contradiction is named at the point of use and the measurement is followed. A summary of how
+this document differs from the revision reviewed on 23 July is given in the pull-request
+description rather than here, so that this file stays a design document and not a changelog.
 
 ## Goal
 Chromatix will perform the production optical calculation from illumination-field construction to camera-plane intensity. **[Settled]**
@@ -189,6 +160,16 @@ implementation must satisfy — not because a separate `np.exp` will be written.
 everywhere. There is no absorption term, no imaginary refractive index, no birefringence, no
 BPM and no three-dimensional specimen in this model.
 
+**On the dropped `exp(-absorption)` factor.** The general form of the transmittance is
+`transmission = exp(-absorption) * exp(1j * phase_rad)`, and that is the form to return to if
+an absorbing specimen is ever required. It is not carried in the equation above because the
+initial model is specified as unit amplitude transmittance, which fixes `absorption = 0` and
+makes `exp(-absorption)` identically 1. Writing a factor that is provably 1 would suggest an
+absorption model exists when it does not. The extension point is not lost: `thin_sample`
+takes `absorption` as a first-class argument, so reinstating the factor is a change of one
+argument rather than a change of the pipeline. `absorption` is dimensionless and has shape
+`[H, W]` when it is reinstated.
+
 **Why one scalar transmittance may multiply every field component.** For the initial model,
 the specimen is thin, isotropic and non-birefringent. Because there is no structural optical
 anisotropy, the refractive index does not depend on the polarisation direction of the incident
@@ -228,6 +209,11 @@ argument valid, and both are tested rather than asserted:
   [Known assumptions and limitations](#known-assumptions-and-limitations).
 
 ## Chromatix optical path
+
+Chromatix will perform the production optical propagation. It will not be used only for sensor
+noise. Every step in the flow below — source construction, the specimen interaction, the
+aperture stop, the objective and the camera relay — is a Chromatix call operating on a
+Chromatix `Field`; no propagation is reimplemented here.
 
 ### How the documentation links in this document are constructed
 
@@ -373,8 +359,21 @@ are summed.
 **Pipeline.** Flow: Plane wave -> Specimen (amplitude and phase) -> Objective aperture stop ->
 Objective pupil and defocus -> Camera-plane field -> Intensity
 
-Note the explicit **aperture-stop** step. It is not optional and it is not supplied by
-`high_na_ff_lens`; see [Objective pupil and camera relay](#chromatix-optical-path) below.
+This is the required flow with two deliberate differences, both stated here rather than left
+for the reader to notice:
+
+* **The sample-amplitude and sample-phase steps are merged into one specimen step.** They are
+  not dropped. Chromatix applies both in a single call, `thin_sample(field, absorption, dn,
+  thickness)`, whose `absorption` argument is the amplitude half and whose `dn` and `thickness`
+  arguments are the phase half. Splitting them would mean calling `amplitude_change` with an
+  all-ones array purely to preserve a step boundary, which adds an operation that provably does
+  nothing. The two halves remain separately addressable through the two argument groups, and
+  the fallback route that does keep them as two calls is described in
+  [Specimen step](#chromatix-optical-path) below.
+* **An explicit aperture-stop step is inserted.** It is not optional and it is not supplied by
+  `high_na_ff_lens`, which was measured not to truncate; see
+  [Objective pupil and camera relay](#chromatix-optical-path) below. Without it the model has
+  no objective bandwidth limit at all, and omitting it raises no error.
 
 Every entry in the table below was checked against the pinned 0.6.0 source tree. All of these
 functions are re-exported at the top level of `chromatix.functional` by the wildcard imports
@@ -390,13 +389,13 @@ valid; the fully qualified module is given because that is where the implementat
 | Camera-plane field, tube-lens relay | `chromatix.functional.lenses.ff_lens` | `ff_lens(field, f, n, NA=None, inverse=False)` | [ff_lens](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.lenses.ff_lens) |
 | Intensity | `chromatix.core.field.Field.intensity` | `@property def intensity(self) -> Array` | [Field.intensity](https://chromatix.readthedocs.io/en/latest/api/field/#chromatix.core.field.Field.intensity) |
 
-The two functions that the previous revision of this document used for the specimen,
+A second pair of functions can build the specimen step as two separate calls,
 [`amplitude_change(field, amplitude: Float[Array, "h w"])`](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.amplitude_masks.amplitude_change)
 and
-[`phase_change(field, phase: Float[Array, "h w"], spectrally_modulate: bool = True)`](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.phase_masks.phase_change),
-remain
-correct in signature and behaviour and are described below as the fallback route. They are no
-longer the primary proposal, for the reason given in [Specimen step](#chromatix-optical-path).
+[`phase_change(field, phase: Float[Array, "h w"], spectrally_modulate: bool = True)`](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.phase_masks.phase_change).
+Both are correct in signature and behaviour and both are verified against the pinned tree.
+They are described below as the fallback route rather than the primary proposal, for the
+reason given in [Specimen step](#chromatix-optical-path).
 
 **Plane wave.** The vector source is `plane_wave` called with `scalar=False`, which the
 verified signature documents as returning a `VectorField` rather than a `ScalarField`. The
@@ -460,8 +459,8 @@ if spectrally_modulate:
     phase = spectrally_modulate_phase(phase, field.spectrum)   # phase * spectrum.spectral_modulation
 ```
 
-**The Chromatix docstring for this factor is wrong, and the previous revision of this document
-repeated the error.** The docstring of both `phase_change` and `spectrally_modulate_phase`
+**The Chromatix docstring for this factor is wrong.** The docstring of both `phase_change` and
+`spectrally_modulate_phase`
 describes the factor as "the ratio of each wavelength to the central wavelength of the
 spectrum", that is `wavelength / wavelength_reference`. The implementation
 ([Spectrum.spectral_modulation](https://chromatix.readthedocs.io/en/latest/api/core/#chromatix.core.spectrum.Spectrum.spectral_modulation),
@@ -515,8 +514,8 @@ None of these extra choices are supplied automatically just because `high_na_ff_
 a vector field. Each is a **[Gate]**; see
 [Known assumptions and limitations](#known-assumptions-and-limitations).
 
-**[Settled] The `NA` argument of `high_na_ff_lens` is not an aperture stop.** This corrects a
-claim in the previous revision of this document. `high_na_ff_lens` does not truncate the
+**[Settled] The `NA` argument of `high_na_ff_lens` is not an aperture stop.** The name invites
+the opposite reading, so the point is made explicitly. `high_na_ff_lens` does not truncate the
 incoming field: it forwards it to `cartesian_to_spherical`, whose mask
 ([cartesian_to_spherical](https://chromatix.readthedocs.io/en/latest/api/field/#chromatix.core.field.cartesian_to_spherical),
 `src/chromatix/core/field.py:918-921`) is used **only** to clamp the angle,
@@ -556,7 +555,8 @@ silently produces an image with no objective bandwidth limit at all, which is wh
 out here and tested by V7.
 
 **[Settled] `high_na_ff_lens` does not conserve energy, and its scaling depends on
-`output_dx`.** This corrects a second claim in the previous revision. The function applies
+`output_dx`.** Neither property is stated on its documentation page, so both were measured.
+The function applies
 
 ```python
 defocus = jnp.where(sz != 0.0, jnp.exp(1j * k * sz * f) / sz, 0.0)   # lenses.py:145
@@ -605,9 +605,9 @@ and `compute_transfer_propagator`
 the two is used is a **[Gate]** pending the low-NA paraxial benchmark described in
 [Known assumptions and limitations](#known-assumptions-and-limitations).
 
-**The local variable named `defocus` inside `high_na_ff_lens` is not a user defocus.** The
-previous revision warned that adding our own defocus would double-count against it; that
-warning was based on the variable's name and is withdrawn. The term is
+**The local variable named `defocus` inside `high_na_ff_lens` is not a user defocus.** Its
+name suggests that supplying our own defocus would double-count against it. Reading the term
+shows that it would not. The term is
 
 ```python
 defocus = jnp.where(sz != 0.0, jnp.exp(1j * k * sz * f) / sz, 0.0)   # lenses.py:145
@@ -619,9 +619,6 @@ defocus entered at the pupil as `exp(1j * k * sz * delta_z)` therefore composes 
 with it, `exp(1j * k * sz * (f + delta_z))`, rather than duplicating it. What *would* be a real
 double-count is applying a defocus at the pupil **and** a propagation kernel over the same
 `delta_z`; that is the case V4 guards against.
-
-Chromatix will perform the production optical propagation. It will not be used only for sensor
-noise.
 
 ## Partial-coherence model
 
@@ -724,10 +721,10 @@ The sensor model maps the continuous optical intensity from the simulation grid 
 discrete physical pixels of the camera. The continuous intensity field is integrated over the
 active area of each physical pixel.
 
-**The camera-plane sample spacing is not free.** This is a correction to the previous
-revision, which computed the binning ratio purely from `objective_magnification` as if the
-field arriving at the detector were still sampled on the object-plane grid. It is not. The
-last optical step sets the spacing:
+**The camera-plane sample spacing is not free.** It is tempting to derive the binning ratio
+purely from `objective_magnification`, as if the field arriving at the detector were still
+sampled on the object-plane grid. It is not: the last optical step sets the spacing, and the
+value it sets must be read back from the field rather than assumed. Specifically:
 
 * `ff_lens` **imposes** its output spacing. It delegates to `optical_fft`, which sets
   `du = field.df * abs(lambda * z / n)`
@@ -810,10 +807,11 @@ Chromatix supplies both halves of this and we use them rather than writing our o
   implementation must use the literal `"pool"` and a test must assert that the returned object
   is a `PoolingPlaneDownsampler`.
 
-**[Gate] withdrawn.** The previous revision asked whether SyMBac should constrain
-`resize_amount` so that `bin_factor` is exactly an integer, on the grounds that it would
-remove the interpolation. Chromatix already handles the non-integer case with correct photon
-accounting, so this is no longer a blocking question. Integer `bin_factor` remains
+**Non-integer `bin_factor` is not a supervisor gate.** Whether SyMBac should constrain
+`resize_amount` so that `bin_factor` is exactly an integer is a reasonable question, since an
+integer ratio would remove the interpolation entirely. It is not a blocking one: Chromatix
+already handles the non-integer case with correct photon accounting. Integer `bin_factor`
+remains
 *preferable* — `"pool"` is exact where interpolation is merely area-correct on average — so
 the implementation should emit a warning, not an error, when `bin_factor` is not an integer.
 
@@ -958,7 +956,7 @@ approval" rather than guessed.
   named `defocus` inside `high_na_ff_lens`: as set out in
   [Chromatix optical path](#chromatix-optical-path) that term is the fixed-`f` propagation
   phase and obliquity Jacobian, and it composes multiplicatively with a user defocus rather
-  than duplicating it. The previous revision's warning on that point was withdrawn.
+  than duplicating it.
 
 **V5 Source and spectral sampling convergence**
 
@@ -968,9 +966,9 @@ approval" rather than guessed.
   simulated condenser source points, and separately the number of discrete wavelength bins,
   increases.
 * Tolerance. For source count, the relative L2 change between successive doublings
-  `‖I_2N − I_N‖₂ / ‖I_N‖₂ < 1%`, sustained for at least one further doubling to rule out a
-  transient plateau. For spectral bins, the same criterion and the same 1% threshold applied
-  to successive doublings of the bin count.
+  `norm(I_2N - I_N) / norm(I_N) < 0.01`, sustained for at least one further doubling to rule
+  out a transient plateau. For spectral bins, the same criterion and the same 1% threshold
+  applied to successive doublings of the bin count.
 * Structural note on the spectral half. The wavelength bins are **separate monochromatic runs**
   summed with `spectral_weights`, not a single `Spectrum` handed to one pipeline call, because
   `high_na_ff_lens` raises `TypeError` on a `ChromaticVectorField`. Each run must additionally
@@ -999,12 +997,11 @@ approval" rather than guessed.
 **V7 Constant incident photon scaling**
 
 Note that this test deliberately does **not** assert that total power is conserved from the
-source to the camera. It cannot be, for two independent reasons, and the previous revision of
-this document stated only the first and stated it incorrectly:
+source to the camera. It cannot be, for two independent reasons:
 
 1. **The objective pupil truncates.** Light the specimen diffracts beyond `objective_na` is
-   removed and never reaches the camera. The previous revision attributed that truncation to
-   the `NA` argument of `high_na_ff_lens`. That is wrong: as measured in
+   removed and never reaches the camera. The truncation is **not** performed by the `NA`
+   argument of `high_na_ff_lens`: as measured in
    [Chromatix optical path](#chromatix-optical-path), `high_na_ff_lens` does not truncate
    anything, and the truncation happens only because *we* apply `circular_pupil` as an
    explicit pipeline step. The physics of the claim survives; its mechanism was misattributed.
@@ -1191,7 +1188,7 @@ conservation is asserted only over the sub-chain that actually has it.
     [Chromatix optical path](#chromatix-optical-path), `high_na_ff_lens` multiplies total
     power by an `output_dx`-dependent factor measured at 18.2 and 72.3 for two spacings, so
     without dividing it back out the absolute photon count is wrong by more than an order of
-    magnitude. The previous revision of this document omitted this term.
+    magnitude.
   * (b) The total is invariant to a change of `resize_amount`, which is the property that
     confirms the sensor binning sums rather than averages.
   * (c) **Sampling consistency.** `camera_pixel_size_um / field.central_dx` at the camera
@@ -1321,9 +1318,8 @@ not merely a metadata floor: the source uses `from typing import Self`
 3.10 or newer. **The intersection of the two constraints is exactly Python 3.12** — a single
 version, not a range.
 
-The previous revision said that "Python 3.12 resolves inside the current constraint and no
-change to that constraint is requested", which is true but understates the consequence. The
-consequence is:
+It is true, but too weak a statement, to say only that Python 3.12 resolves inside the current
+constraint and that no change to that constraint is requested. The consequence is sharper:
 
 * Adding Chromatix does not widen SyMBac's supported Python range; it narrows the range on
   which the brightfield feature can exist at all to `3.12` alone.
@@ -1368,8 +1364,8 @@ vectorial diffraction theory, for example as set out in Novotny and Hecht, *Prin
 Nano-Optics*, or against an independent rigorous coupled-wave analysis (RCWA) benchmark.
 Decided by V14.
 
-Two sub-questions that the previous revision folded into this one have since been resolved and
-are no longer gates:
+Two sub-questions naturally attach to this gate but are **not** themselves gates, because
+measurement settled both:
 
 * *The angular support* is ours to impose. `high_na_ff_lens` does not truncate; the aperture
   stop is an explicit `circular_pupil` step in the pipeline, as measured and documented in
@@ -1415,15 +1411,15 @@ is unresolved. *Proposal:* choose between
 them by benchmarking against the low-NA paraxial limit, where the defocus phase has a known
 closed form, using V4 for the sign convention and V10 for the magnitude.
 
-The previous revision added that `high_na_ff_lens` "already computes an internal defocus
-correction, so applying a second one naively would double-count". That is withdrawn: the local
-variable named `defocus` at `src/chromatix/functional/lenses.py:145`
+One apparent constraint on that choice turns out not to be real, and is recorded here so that
+it is not raised again. It is natural to assume that `high_na_ff_lens` already computes an
+internal defocus correction, and therefore that applying a second one would double-count. It
+does not: the local variable named `defocus` at `src/chromatix/functional/lenses.py:145`
 ([high_na_ff_lens](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.lenses.high_na_ff_lens);
 the published page shows only the docstring, which does not mention this term at all) is the
-fixed-`f`
-propagation phase together with the obliquity Jacobian, evaluated at `z = f` with no adjustable
-displacement, so a user defocus composes with it rather than duplicating it. The real
-double-count risk is applying a pupil phase **and** a propagation kernel over the same
+fixed-`f` propagation phase together with the obliquity Jacobian, evaluated at `z = f` with no
+adjustable displacement, so a user defocus composes with it rather than duplicating it. The
+real double-count risk is applying a pupil phase **and** a propagation kernel over the same
 `defocus_um`, which is what V4 actually guards.
 
 **Overlapping cells in the existing input.** As documented in

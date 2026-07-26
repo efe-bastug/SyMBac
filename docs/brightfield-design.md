@@ -1,7 +1,63 @@
 # Chromatix brightfield design
 
+Status markers used throughout this document: **[Settled]** is a decision already fixed by
+the existing SyMBac code or by an instruction from the supervisor; **[Proposed]** is a choice
+made in this document that is open to review; **[Gate]** is an unresolved question that must
+be approved by the supervisor before the corresponding code is written.
+
+Every Chromatix signature quoted below was read from the pinned 0.6.0 source tree and the
+official documentation pages linked in [Chromatix optical path](#chromatix-optical-path);
+none of them is quoted from memory or from an example found elsewhere. The validation tests
+are numbered V1 to V14 in [Validation tests](#validation-tests) and are referred to by those
+numbers throughout.
+
+**Behavioural claims are measured, not inferred from docstrings.** Several statements below
+concern what Chromatix 0.6.0 actually *does*, not merely what it is declared to accept. Where
+that is the case the claim was checked by executing the pinned source tree, and the measured
+number is quoted inline. Two Chromatix docstrings were found to contradict their own
+implementation (`spectrally_modulate_phase` and `init_plane_resample`); in both cases this
+document follows the implementation and says so explicitly.
+
+## Corrections to the previous revision
+
+The previous revision was written from signatures and docstrings. Executing the pinned tree
+invalidated four of its claims and resolved three of its open questions. Both lists are given
+here so that a reviewer who read the earlier draft can see exactly what moved.
+
+**Claims withdrawn as incorrect:**
+
+| Previous claim | What the pinned tree actually does | Reference |
+| :--- | :--- | :--- |
+| The `NA` argument of `high_na_ff_lens` acts as an aperture stop, truncating light beyond `objective_na`. | It does not truncate. The mask only clamps the angle; light outside the pupil passes through as if at normal incidence. Measured 0.55 maximum relative difference against a run with an explicit `circular_pupil`. An explicit aperture-stop step is now part of the pipeline. | [cartesian_to_spherical](https://chromatix.readthedocs.io/en/latest/api/field/#chromatix.core.field.cartesian_to_spherical), `field.py:918-921` |
+| In the specimen-free run, total power at the camera equals total launched power (V7(b)). | `high_na_ff_lens` is not power preserving and its scaling depends on `output_dx`: measured ratios of 18.2 and 72.3. V7(b) is now restricted to the `plane_wave` plus `ff_lens` sub-chain, which is conserving to `1e-7`. | [high_na_ff_lens](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.lenses.high_na_ff_lens), `lenses.py:145-154` |
+| `high_na_ff_lens` "computes an internal defocus correction of its own, so the two must not be applied twice." | The variable named `defocus` is the fixed-`f` propagation phase and obliquity Jacobian at `z = f`. A user defocus composes with it multiplicatively. The double-count risk lies elsewhere and V4 was rewritten accordingly. | [high_na_ff_lens](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.lenses.high_na_ff_lens), `lenses.py:145` |
+| The `spectrally_modulate` factor is "the ratio of each wavelength to the central wavelength", as the Chromatix docstring states. | The implementation returns the reciprocal, `central_wavelength / wavelength`. The docstring is wrong. Measured `[1.0000, 1.1822, 0.8185]` for `[0.532, 0.450, 0.650] um`. | [Spectrum.spectral_modulation](https://chromatix.readthedocs.io/en/latest/api/core/#chromatix.core.spectrum.Spectrum.spectral_modulation), `spectrum.py:97-103` |
+
+Note that in all four rows the published documentation page renders the **docstring**, which is
+either silent on the point or actively wrong. That is the reason this document cites source
+lines alongside every documentation link rather than relying on the published pages alone.
+
+**Open questions closed by inspection or measurement:**
+
+| Previously open | Now |
+| :--- | :--- |
+| The `kykx` mapping "is a proposed convention, not yet independently verified". | Verified: phase residual `1.2e-6` across three test directions, with `NA_y` on axis 0. V11 becomes a regression guard. |
+| V12 must determine "which direction of the ratio Chromatix applies". | Determined statically from `Spectrum.spectral_modulation`. V12 becomes a regression guard. |
+| **[Gate]** on whether `resize_amount` must be constrained so `bin_factor` is an integer. | Withdrawn. Chromatix's `init_plane_resample` already handles the non-integer case with correct photon accounting. Integer remains preferable, so the implementation warns rather than errors. |
+
+**Newly identified, not present in the previous revision at all:** `high_na_ff_lens` rejects
+polychromatic fields outright; the camera-plane sample spacing is imposed by the lens rather
+than chosen; the aplanatic `sqrt(cos theta)` apodisation is absent from Chromatix's transfer
+matrix; `init_plane_resample` silently ignores the spelling `"pooling"`; the Chromatix and
+SyMBac Python constraints intersect at exactly 3.12; and `E_z` is populated at order `NA`
+rather than being "numerically zero".
+
 ## Goal
-Chromatix will perform the production optical calculation from illumination-field construction to camera-plane intensity.
+Chromatix will perform the production optical calculation from illumination-field construction to camera-plane intensity. **[Settled]**
+
+There will be exactly one production brightfield path and it will be vectorial. No scalar
+production implementation is proposed; the only scalar calculation in this design is a
+test-only comparison used inside its stated paraxial validity range (V10).
 
 ## Non-goals
 This task does not implement:
@@ -14,13 +70,80 @@ This task does not implement:
 * Renderer integration.
 
 ## Existing SyMBac input
-`OPL_scene` arrays are generated by `Simulation.draw_simulation_OPL` and `draw_scene_from_segments`. Despite the legacy name, these arrays store projected geometric cell thickness in supersampled simulation pixels, not the optical path length. Overlapping projected cells are currently treated with a winner-takes-all depth projection; overlap pixels are not additive thickness.
 
-The values are converted to physical micrometres using `pix_mic_conv` and `resize_amount`. Here, `pix_mic_conv` is the simulation/object-plane pixel-to-micron conversion factor (it is strictly not the camera pixel size), and `resize_amount` is a dimensionless upscaling factor.
+**Where the arrays are generated.** `OPL_scene` arrays are generated by
+`Simulation.draw_simulation_OPL` (`SyMBac/simulation.py:861`, on the `Simulation` class
+defined at `SyMBac/simulation.py:27`), which delegates the per-pixel rasterisation to
+`draw_scene_from_segments` (`SyMBac/drawing.py:191`). A second entry point,
+`ColonySimulation.draw_simulation_OPL` (`SyMBac/colony_simulation.py:242`), produces arrays
+with the same physical meaning for colony rather than mother-machine geometries; the
+brightfield module will accept either, since it only consumes the resulting array and the two
+scaling scalars.
+
+**What the values physically represent.** Despite the legacy name, these arrays store
+projected geometric cell thickness in supersampled simulation pixels, not the optical path
+length. This is visible in the rasteriser itself (`SyMBac/drawing.py:265-277`): each cell is a
+chain of overlapping spheres, and for every segment `i` of radius `R_i` at in-plane distance
+`d_i` from the pixel centre the code accumulates
+
+```text
+z_i    = sqrt(R_i^2 - d_i^2)      for d_i < R_i, else 0
+scene  = 2 * max_i(z_i)
+```
+
+`2 * sqrt(R^2 - d^2)` is the chord length of a sphere of radius `R` at in-plane offset `d`,
+that is, the geometric thickness of the sphere along the projection axis, expressed in
+simulation pixels. No refractive index appears anywhere in that expression, which is why the
+array is a thickness and not an optical path length. Multiplying it by a refractive-index
+difference is therefore the responsibility of this brightfield module, not of the rasteriser.
+
+**Overlapping cells.** Overlapping projected cells are currently treated with a
+winner-takes-all depth projection; overlap pixels are not additive thickness. The rule is
+explicit at `SyMBac/drawing.py:294-297`:
+
+```python
+claim = cell_opl > owner_patch
+owner_patch[claim] = cell_opl[claim]
+label_patch[claim] = sim_mask_label
+```
+
+In a contested pixel the cell with the **larger** projected thickness wins outright and the
+other cell contributes nothing there; it is not a last-writer-wins rule and it is not a sum.
+The in-code comment at `SyMBac/drawing.py:226-229` records the reason: the buffers exist so
+that overlap pixels are not zeroed, which would otherwise create artificial cracks between
+touching cells.
+
+The optical consequence is that where cells overlap the model understates the true integrated
+phase, because the physically correct quantity there is the sum of the thicknesses along the
+ray. This is a known limitation of the existing input, not something this design introduces or
+corrects; it is recorded in
+[Known assumptions and limitations](#known-assumptions-and-limitations).
+
+**Conversion to micrometres.** The values are converted to physical micrometres using
+`pix_mic_conv` and `resize_amount`. `pix_mic_conv` is the simulation/object-plane
+pixel-to-micron conversion factor — its docstring at `SyMBac/simulation.py:107-108` reads
+"The micron/pixel size of the image" — and it is strictly **not** the camera pixel size; the
+camera pixel pitch is a separate quantity (`camera_pixel_size_um`) related to it only through
+the objective magnification, as set out in [Sensor model](#sensor-model). `resize_amount` is
+the dimensionless supersampling factor applied across the whole image-generation pipeline
+(`SyMBac/simulation.py:130-132`).
+
+SyMBac already combines the two into a single pixels-per-micron scale at
+`SyMBac/simulation.py:335`:
+
+```python
+scale_factor = (1 / self.pix_mic_conv) * self.resize_amount   # supersampled pixels per micron
+```
+
+Dividing a length in supersampled pixels by `scale_factor` therefore gives micrometres, which
+is exactly the conversion used in [Physical specimen model](#physical-specimen-model).
 
 ## Physical specimen model
+
 ```python
 thickness_um = OPL_scene * pix_mic_conv / resize_amount
+
+refractive_index_difference = cell_refractive_index - sample_medium_refractive_index
 
 phase_rad = (
     2 * np.pi / wavelength_vacuum_um
@@ -31,255 +154,1282 @@ phase_rad = (
 transmission = np.exp(1j * phase_rad)
 ```
 
-OPL_scene: 2D array, shape [H, W], dimensionless supersampled pixels.
+**Definition of every term.**
 
-pix_mic_conv: Scalar, simulation pixel-to-micron conversion factor, um.
+| Term | Type | Shape | Unit | Meaning |
+| :--- | :--- | :--- | :--- | :--- |
+| `OPL_scene` | real array | `[H, W]` | supersampled simulation pixels (dimensionless count) | Projected geometric cell thickness from the rasteriser |
+| `pix_mic_conv` | scalar | `()` | um (per simulation pixel) | Object-plane pixel-to-micron conversion factor |
+| `resize_amount` | scalar | `()` | dimensionless | Supersampling (upscaling) factor of the simulation grid |
+| `thickness_um` | real array | `[H, W]` | um | Physical projected specimen thickness |
+| `cell_refractive_index` | scalar | `()` | dimensionless | Refractive index of the cell |
+| `sample_medium_refractive_index` | scalar | `()` | dimensionless | Refractive index of the surrounding medium |
+| `refractive_index_difference` | scalar | `()` | dimensionless | Cell minus medium refractive index |
+| `wavelength_vacuum_um` | scalar | `()` | um | Vacuum wavelength of the illumination |
+| `phase_rad` | real array | `[H, W]` | rad | Phase delay imposed by the specimen |
+| `transmission` | complex array | `[H, W]` | dimensionless | Complex scalar amplitude transmittance, `abs(transmission) == 1` |
 
-resize_amount: Scalar, dimensionless upscaling factor.
+`thickness_um` is dimensionally consistent: `OPL_scene` is a pixel count, `pix_mic_conv` has
+unit um per simulation pixel and `resize_amount` is dimensionless, so the product has unit um.
+The division by `resize_amount` undoes the supersampling, matching the pixels-per-micron scale
+used by SyMBac itself at `SyMBac/simulation.py:335`.
 
-thickness_um: 2D array, shape [H, W], physical thickness, um.
+`phase_rad` is likewise consistent: `2 * pi / wavelength_vacuum_um` has unit rad/um, the
+refractive-index difference is dimensionless and `thickness_um` has unit um, so the product
+has unit rad.
 
-wavelength_vacuum_um: Scalar, vacuum wavelength, um.
+**This equation is not implemented by hand.** Chromatix 0.6.0 already contains it exactly, as
+`thin_sample(field, absorption, dn, thickness)`; see
+[Chromatix optical path](#chromatix-optical-path) for the verified implementation and for the
+numerical agreement between the two. The expression above is retained here because it is the
+definition this document audits and because the units table below is the contract the
+implementation must satisfy — not because a separate `np.exp` will be written.
 
-refractive_index_difference: Scalar, dimensionless difference between cell and medium.
+**[Settled]** The initial specimen has unit amplitude transmittance: `abs(transmission) == 1`
+everywhere. There is no absorption term, no imaginary refractive index, no birefringence, no
+BPM and no three-dimensional specimen in this model.
 
-phase_rad: 2D array, shape [H, W], phase shift in radians.
+**Why one scalar transmittance may multiply every field component.** For the initial model,
+the specimen is thin, isotropic and non-birefringent. Because there is no structural optical
+anisotropy, the refractive index does not depend on the polarisation direction of the incident
+light. Consequently the sample acts as a uniform phase delay across all polarisations.
 
-transmission: 2D array, shape [H, W], complex scalar amplitude transmittance.
-For the initial model, the specimen is thin, isotropic, and non-birefringent. Because there is no structural optical anisotropy, the refractive index does not depend on the polarisation direction of the incident light. Consequently, the sample acts as a uniform phase delay across all polarisations. This explains why the same unit-amplitude scalar transmission can safely multiply every electric-field component; mathematically, it acts as a scalar multiplier distributed across the Chromatix field components $[E_z, E_y, E_x]$:$$ \vec{E}{out} = \text{transmission} \cdot \vec{E}{in} = [\text{transmission} \cdot E_z, \text{transmission} \cdot E_y, \text{transmission} \cdot E_x] $$While the free-space propagation and focusing steps through the rest of the microscope remain fully vectorial, this specific specimen interaction delays all polarisation components equally without mixing them. This physical justification satisfies the requirement without needing to introduce an imaginary refractive index, absorption, birefringence, BPM or a three-dimensional specimen merely to obtain a plausible image.
+This is why the same unit-amplitude scalar transmission can safely multiply every
+electric-field component: mathematically it is a scalar multiplier distributed across the
+Chromatix field components $[E_z, E_y, E_x]$,
 
+$$
+\vec{E}_{\text{out}} = t \cdot \vec{E}_{\text{in}}
+= [\, t E_z,\; t E_y,\; t E_x \,],
+\qquad t \equiv \texttt{transmission}.
+$$
 
+Because $t$ is the same complex number for all three components at a given pixel, it cannot
+rotate the polarisation ellipse, transfer energy between components or change the relative
+phase between them. It only delays them together.
 
+While the free-space propagation and focusing steps through the rest of the microscope remain
+fully vectorial, this specific specimen interaction delays all polarisation components equally
+without mixing them. This physical justification satisfies the requirement without needing to
+introduce an imaginary refractive index, absorption, birefringence, BPM or a three-dimensional
+specimen merely to obtain a plausible image.
+
+Two consequences are worth stating plainly, because they are the assumptions that make the
+argument valid, and both are tested rather than asserted:
+
+* A pure phase object is invisible in a perfectly focused, fully coherent, unaberrated imaging
+  system. Contrast in this model comes from defocus and from the finite condenser and
+  objective apertures, not from absorption. If the model produced strong in-focus contrast
+  from a phase-only specimen, that would be a bug and not a feature.
+* Transversality after the specimen is not automatic. Multiplying by a spatially varying
+  $t(y, x)$ changes the local propagation direction, so a field that satisfied
+  $\vec{k} \cdot \vec{E} = 0$ before the specimen no longer satisfies it exactly afterwards.
+  This is a **[Gate]** recorded in
+  [Known assumptions and limitations](#known-assumptions-and-limitations).
 
 ## Chromatix optical path
-Field Representation and Conventions
 
-All optical elements operate on Chromatix Field objects. For a VectorField, the three Cartesian electric-field components occupy the trailing array axis in the fixed order [z, y, x], where z is the nominal propagation axis (Chromatix Polarization guide).
+### How the documentation links in this document are constructed
 
-For the forward-propagating fields used here, z is expected to stay at (numerically) zero away from strongly non-paraxial elements, and the physically populated components are y (index 1) and x (index 2).
+Every formula quoted from Chromatix below carries **two** citations in parentheses: the
+official documentation page, and the file and line in the pinned 0.6.0 source tree. The
+documentation link is what a reviewer should follow; the source line is what was actually read,
+and is given because the published pages render docstrings, not implementations, and in two
+cases the two disagree.
 
-Oblique illumination is described by a kykx wavevector of shape (2,) in the format [k_y, k_x], already multiplied by 2 * pi / wavelength (Chromatix plane_wave docs). We propose constructing this from an illumination-direction description (NA_y, NA_x) (with NA_y^2 + NA_x^2 <= condenser_na^2, see Partial-coherence model) as:
+Chromatix's API pages are generated by `mkdocstrings` from the module lists in
+`docs/api/*.md`, so every anchor is the fully qualified Python name. The mapping is:
 
-kykx = (2 * pi / wavelength_vacuum_um) * (NA_y, NA_x)
+| Chromatix module | Documentation page |
+| :--- | :--- |
+| `chromatix.functional.sources`, `.lenses`, `.phase_masks`, `.amplitude_masks`, `.samples`, `.sensors`, `.propagation`, `.polarizers`, `.convenience` | [api/functional](https://chromatix.readthedocs.io/en/latest/api/functional/) |
+| `chromatix.core.field` (all `Field` classes plus `pad`, `crop`, `shift_grid`, `shift_field`, `cartesian_to_spherical`) | [api/field](https://chromatix.readthedocs.io/en/latest/api/field/) |
+| `chromatix.core.spectrum`, `chromatix.core.base` | [api/core](https://chromatix.readthedocs.io/en/latest/api/core/) |
+| `chromatix.ops.resample` and the other `chromatix.ops` modules | [api/ops](https://chromatix.readthedocs.io/en/latest/api/ops/) |
 
-This gives kykx in rad/um consistent with wavelength_vacuum_um in um. This mapping is a proposed convention, not yet independently verified; see Partial-coherence model for how we intend to test it.
+So, for example, `thin_sample` is documented at
+`https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.samples.thin_sample`.
 
-Pipeline
+**Two things this design depends on have no published documentation page at all.** This is a
+property of Chromatix's `mkdocs.yml`, not an oversight in this document, and it is recorded so
+that no reviewer wastes time hunting for a link that does not exist:
 
-Flow: Plane wave -> Sample amplitude -> Sample phase -> Objective pupil and defocus -> Camera-plane field -> Intensity
+* **`chromatix.functional.pupils` is not published.** `docs/api/functional.md` lists nine
+  modules — Sources, Lenses, Phase Masks, Amplitude Masks, Samples, Sensors, Propagation,
+  Polarization, Convenience — and `pupils` is not among them. Confirmed against the live
+  [api/functional](https://chromatix.readthedocs.io/en/latest/api/functional/) page, whose
+  section list matches exactly. Since `circular_pupil` is the objective aperture stop and
+  therefore load-bearing for this design, it is cited from source and from the
+  [High-NA vectorial PSF example](https://chromatix.readthedocs.io/en/latest/examples/highNA_PSF/),
+  which is the only published usage.
+* **The module-level `grid` helper in `chromatix.core.field` is not published.**
+  `docs/api/field.md` exposes the `Field` classes and four helpers, but not `grid`, so the
+  sampling convention that V3 and V4 depend on is documented only in source.
 
-Step-by-Step Implementation:
+**Field representation and conventions.** **[Settled]** All optical elements operate on
+Chromatix `Field` objects. For a `VectorField` the three Cartesian electric-field components
+occupy the trailing array axis in the fixed order `[z, y, x]`, where `z` is the nominal
+propagation axis. The
+[Chromatix polarization guide](https://chromatix.readthedocs.io/en/latest/polarization/)
+states this directly: "The order of the components is `[z, y, x]`, where `z` is the
+propagation direction, so for now this will always be zero."
 
-Plane wave (per source point / polarisation state) - Function: chromatix.functional.plane_wave (https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.sources.plane_wave)
+**That quoted sentence does not describe this design.** "So for now this will always be zero"
+is a statement about the Chromatix authors' own on-axis usage, not a property of the field
+type, and it must not be carried over here. Our oblique condenser points require
+$\vec{k} \cdot \vec{E} = 0$ with $\vec{k}$ tilted, which populates `z` (index 0) at order
+`NA`. Measured against the pinned tree for the Gram-Schmidt basis of
+[Partial-coherence model](#partial-coherence-model): at `(NA_y, NA_x) = (0, 0.6)` the two
+states carry $|E_{1,z}| = 0.000$ and $|E_{2,z}| = 0.600$; at `(0.3, 0.4)` they carry
+$0.272$ and $0.419$. So at `condenser_na = 0.6` roughly a third of the second state's
+intensity sits in `z`, and treating it as numerically zero would discard it.
 
-Sample amplitude - Function: chromatix.functional.amplitude_change (https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.amplitude_masks.amplitude_change)
+This is consistent rather than problematic, because `VectorField.intensity` is
+`sum(abs(u)**2)` over all three components
+([VectorField.intensity](https://chromatix.readthedocs.io/en/latest/api/field/#chromatix.core.field.VectorField.intensity),
+`src/chromatix/core/field.py:812-813`) and
+therefore already includes `E_z`. The point to record is only that `z` is physically
+populated here and is not a residual: any code or test that assumes `u[..., 0] == 0` is
+wrong for this design. This is checked by V8.
 
-Sample phase - Function: chromatix.functional.phase_change (https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.phase_masks.phase_change)
+**[Settled]** Oblique illumination is described by a `kykx` wavevector of shape `(2,)` in the
+format `[k_y, k_x]`. The verified `plane_wave` docstring says these are "wave vectors, i.e.
+that they have already been multiplied by `2 * pi / wavelength`", so `kykx` carries unit
+rad/um. We construct it from an illumination-direction description `(NA_y, NA_x)` with
+`NA_y**2 + NA_x**2 <= condenser_na**2` as
 
-Objective pupil (and, pending validation, defocus) - Function: chromatix.functional.high_na_ff_lens (https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.lenses.high_na_ff_lens)
+```python
+kykx = (2 * np.pi / wavelength_vacuum_um) * np.array([NA_y, NA_x])
+```
 
-Camera-plane field (tube-lens relay) - Function: chromatix.functional.ff_lens (https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.lenses.ff_lens)
+The physical justification is that the transverse wavevector of a plane wave travelling at
+angle `theta` in a medium of index `n` is
+`k_t = (2*pi/wavelength_vacuum_um) * n * sin(theta)`, and `n * sin(theta)` is by definition
+the numerical aperture coordinate. Writing the mapping in terms of NA rather than in terms of
+an angle therefore removes any ambiguity about which refractive index the angle is measured
+in.
 
-Intensity - Function: .intensity property of the resulting Field (https://chromatix.readthedocs.io/en/latest/api/field/#chromatix.core.field.Field.intensity)
+This mapping has now been verified against the pinned source tree rather than assumed. The
+implementation is `u = amplitude * exp(1j * sum(kykx * field.grid, axis=-1))`
+([plane_wave](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.sources.plane_wave),
+`src/chromatix/functional/sources.py:283`) and `field.grid` carries units of distance, so
+`kykx` must indeed be an angular wavenumber in rad/um. Fitting the launched field against
+`exp(1j * (k_y * y + k_x * x))` for `(NA_y, NA_x)` of `(0, 0.3)`, `(0.25, 0)` and
+`(0.2, -0.1)` leaves a maximum phase residual of `1.2e-6` in every case, with `NA_y` mapping
+to array axis 0 and `NA_x` to array axis 1, and with the sign as written. V11 is retained as
+a regression test rather than as an open question.
 
-Production and Propagation Details
+**Incident power normalisation.** **[Proposed]** A unit-norm Jones vector is not a power
+normalisation, and the verified `plane_wave` docstring makes the reason explicit: for the
+`amplitude` argument it says "For scalar `Field`s this doesn't do anything but scale the field
+(which will be undone if `power` is not `None`), but it is required for vectorial `Field`s to
+set the polarization." The polarisation state and the launched power are therefore two
+independent settings, and only `power` controls the latter.
 
-Chromatix will perform the production optical propagation. It will not be used only for sensor noise.
+The stated illumination quantity is an irradiance `source_irradiance` in W/um^2 at the
+specimen plane, not a total array power. For an `H x W` grid with pitch `dx` the physical area
+is `H * W * dx**2`, so each individual run is launched with
 
-chromatix.functional.high_na_ff_lens is a verified, documented Chromatix function, but its documented usage (Chromatix High-NA vectorial PSF generation example) applies it to a field already defined at the objective pupil plane and returns the field at the camera/focal plane. That is, it is documented as a pupil-to-focus operator, not as a complete sample-to-camera transmitted-light microscope.
+```python
+power = source_irradiance * H * W * dx**2 * source_weight
+```
+
+The `power` argument is a *total* power, not an irradiance: the normalisation is
+`field * sqrt(power / field.power)`
+([plane_wave](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.sources.plane_wave),
+`src/chromatix/functional/sources.py:291-292`) and `Field.power` is
+`prod(dx) * sum(intensity)`
+([VectorField.power](https://chromatix.readthedocs.io/en/latest/api/field/#chromatix.core.field.VectorField.power),
+`src/chromatix/core/field.py:805-809`). Dividing
+the stated irradiance by the physical array area is therefore exactly the inversion of what
+Chromatix does internally. Measured: launching `source_irradiance = 3.7` on a `64 x 64` grid
+at `dx = 0.05` gives a per-pixel intensity of `3.69997`, and the same construction on a
+`128 x 128` grid gives `3.69997`.
+
+This is what makes the stated illumination power invariant under the three changes the design
+must be robust to:
+
+* **Array padding.** Here "padding" means constructing the illumination on a larger grid, that
+  is calling `plane_wave` with a larger `shape`, which is how the guard band around the
+  specimen is created. Padding in that sense increases `H * W`, and `power` is scaled by
+  exactly the same factor, so the irradiance per unit physical area is unchanged. Had we
+  instead fixed a constant total `power`, padding would have spread the same energy over a
+  larger area and silently dimmed the image. This is checked by V6. Note that the distinct
+  operation `chromatix.core.field.pad`, which zero-pads an *existing* field, does not change
+  `sum(intensity)` and therefore needs no compensating rescaling; the two must not be
+  confused.
+* **Source angle.** `power` does not depend on `kykx`, so tilting the illumination
+  redistributes energy in the pupil without changing how much was launched.
+* **Polarisation basis.** `power` is set per run and is independent of the `amplitude` Jones
+  vector, so rebuilding the transverse basis cannot change the launched power. This is checked
+  by V8. Measured: a deliberately unnormalised `amplitude = [0, 5, 3]` and a unit-norm
+  `[0, 1, 0]` both yield `field.power = 1.0` to float32.
+
+`source_weight` is the condenser quadrature weight `w_q` defined in
+[Partial-coherence model](#partial-coherence-model), with `sum_q w_q == 1`. It is applied
+once, here, through `power`; it is deliberately not applied a second time when the intensities
+are summed.
+
+**Pipeline.** Flow: Plane wave -> Specimen (amplitude and phase) -> Objective aperture stop ->
+Objective pupil and defocus -> Camera-plane field -> Intensity
+
+Note the explicit **aperture-stop** step. It is not optional and it is not supplied by
+`high_na_ff_lens`; see [Objective pupil and camera relay](#chromatix-optical-path) below.
+
+Every entry in the table below was checked against the pinned 0.6.0 source tree. All of these
+functions are re-exported at the top level of `chromatix.functional` by the wildcard imports
+in `src/chromatix/functional/__init__.py`, so both the short and the fully qualified name are
+valid; the fully qualified module is given because that is where the implementation lives.
+
+| Step | Function (fully qualified) | Verified signature | Documentation |
+| :--- | :--- | :--- | :--- |
+| Plane wave, per source point and polarisation state | `chromatix.functional.sources.plane_wave` | `plane_wave(shape, dx, spectrum, power=1.0, amplitude=1.0, kykx=(0.0, 0.0), pupil=None, scalar=True)` | [plane_wave](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.sources.plane_wave) |
+| Specimen, amplitude and phase in one step | `chromatix.functional.samples.thin_sample` | `thin_sample(field, absorption: Float[Array, "h w"], dn: Float[Array, "h w"], thickness: ScalarLike \| Float[Array, "h w"])` | [thin_sample](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.samples.thin_sample) |
+| Objective aperture stop (**required**, not implied by the `NA` argument of the lens) | `chromatix.functional.pupils.circular_pupil` | `circular_pupil(field, w: ScalarLike)`, where `w` is a **diameter** | **No API page** (`pupils` is absent from `docs/api/functional.md`); source `pupils.py:17-23`, usage in the [High-NA PSF example](https://chromatix.readthedocs.io/en/latest/examples/highNA_PSF/) |
+| Objective pupil and defocus | `chromatix.functional.lenses.high_na_ff_lens` | `high_na_ff_lens(field, f, n, NA, output_shape=None, output_dx=None)` | [high_na_ff_lens](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.lenses.high_na_ff_lens) |
+| Camera-plane field, tube-lens relay | `chromatix.functional.lenses.ff_lens` | `ff_lens(field, f, n, NA=None, inverse=False)` | [ff_lens](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.lenses.ff_lens) |
+| Intensity | `chromatix.core.field.Field.intensity` | `@property def intensity(self) -> Array` | [Field.intensity](https://chromatix.readthedocs.io/en/latest/api/field/#chromatix.core.field.Field.intensity) |
+
+The two functions that the previous revision of this document used for the specimen,
+[`amplitude_change(field, amplitude: Float[Array, "h w"])`](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.amplitude_masks.amplitude_change)
+and
+[`phase_change(field, phase: Float[Array, "h w"], spectrally_modulate: bool = True)`](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.phase_masks.phase_change),
+remain
+correct in signature and behaviour and are described below as the fallback route. They are no
+longer the primary proposal, for the reason given in [Specimen step](#chromatix-optical-path).
+
+**Plane wave.** The vector source is `plane_wave` called with `scalar=False`, which the
+verified signature documents as returning a `VectorField` rather than a `ScalarField`. The
+polarisation state is supplied through `amplitude`, typed `Float[Array, "3"]` and ordered
+`[z, y, x]` to match the field convention above. So a single source run is
+
+```python
+field = plane_wave(
+    shape=(H, W),
+    dx=dx_um,
+    spectrum=wavelength_vacuum_um,
+    power=source_irradiance * H * W * dx_um**2 * w_q,
+    amplitude=jones_zyx,          # shape (3,), the E_1 or E_2 state
+    kykx=kykx,                    # rad/um, from (NA_y, NA_x)
+    scalar=False,                 # -> VectorField
+)
+```
+
+**Specimen step.** **[Proposed]** Chromatix 0.6.0 already implements exactly the specimen
+model defined in [Physical specimen model](#physical-specimen-model). The verified
+implementation of `thin_sample`
+([thin_sample](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.samples.thin_sample),
+`src/chromatix/functional/samples.py:126-134`) is
+
+```python
+sample = jnp.exp(
+    1j * 2 * jnp.pi * (dn + 1j * absorption) * thickness / field.broadcasted_wavelength
+)
+return field * sample
+```
+
+With `dn = refractive_index_difference`, `thickness = thickness_um` and `absorption = 0` this
+is term-for-term our `transmission`, including the `2 * pi / wavelength` prefactor. Verified
+numerically: for `dn = 0.05`, `thickness = 1.0 um` and a two-bin spectrum
+`[0.532, 0.650] um`, the applied phase is `[0.59052, 0.48332] rad` against an analytic
+`2 * pi * dn * t / lambda` of `[0.59052, 0.48332] rad`.
+
+We adopt `thin_sample` as the production specimen step, for three reasons:
+
+* It takes the wavelength from `field.broadcasted_wavelength`, so the `1 / wavelength` factor
+  is applied **exactly once and per wavelength bin**, by construction. The
+  `spectrally_modulate` ambiguity discussed below cannot arise, because `thin_sample` does not
+  expose that argument and does not call `spectrally_modulate_phase`.
+* `absorption` is already a first-class argument, so the extension point that the previous
+  `amplitude_change` identity step existed to preserve is present without an artificial
+  all-ones multiply.
+* It is `field * sample` with `sample` broadcast over the spatial dimensions, so on a
+  `VectorField` it applies the same complex scalar to `[E_z, E_y, E_x]`, which is precisely
+  the argument made in [Physical specimen model](#physical-specimen-model).
+
+Its docstring says "`ScalarField`" but the implementation is type-agnostic; V1 and V2 are run
+on a `VectorField` specifically to pin that down.
+
+**Fallback route, and why `spectrally_modulate` must still be understood.** If the specimen
+step is instead built from `amplitude_change` (an all-ones identity) followed by
+`phase_change`, then `spectrally_modulate` requires an explicit decision, because the verified
+implementation is
+
+```python
+if spectrally_modulate:
+    phase = spectrally_modulate_phase(phase, field.spectrum)   # phase * spectrum.spectral_modulation
+```
+
+**The Chromatix docstring for this factor is wrong, and the previous revision of this document
+repeated the error.** The docstring of both `phase_change` and `spectrally_modulate_phase`
+describes the factor as "the ratio of each wavelength to the central wavelength of the
+spectrum", that is `wavelength / wavelength_reference`. The implementation
+([Spectrum.spectral_modulation](https://chromatix.readthedocs.io/en/latest/api/core/#chromatix.core.spectrum.Spectrum.spectral_modulation),
+`src/chromatix/core/spectrum.py:97-103`) is the reciprocal:
+
+```python
+@property
+def spectral_modulation(self) -> Array:
+    return self.central_wavelength / self.wavelength
+```
+
+Measured on the pinned tree for `wavelength = [0.532, 0.450, 0.650] um`:
+`spectral_modulation = [1.0000, 1.1822, 0.8185]`, which is `lambda_reference / lambda` and not
+`lambda / lambda_reference`. The source of truth is `Spectrum.spectral_modulation`, not the
+docstring.
+
+`lambda_reference / lambda` **is** the physically required scaling for a non-dispersive
+`refractive_index_difference`. So the two routes are
+
+1. Compute `phase_rad` once at the reference vacuum wavelength and pass
+   `spectrally_modulate=True`. Given the measurement above this is now known to be physically
+   correct in 0.6.0, not merely possibly correct.
+2. Compute `phase_rad` per wavelength bin and pass `spectrally_modulate=False`, applying the
+   wavelength dependence ourselves exactly once.
+
+**[Proposed]** If the fallback route is used at all, we take option 2 — not because the
+direction of Chromatix's ratio is unknown (it is now measured), but because option 2 keeps the
+wavelength dependence inside the one equation this document defines and audits, and remains
+correct if a dispersive `refractive_index_difference` is introduced later. For a monochromatic
+spectrum the reference wavelength is the only wavelength, so the factor is exactly 1 and the
+two options coincide; measured on the pinned tree, `spectrally_modulate=True` and `False`
+differ by `0.0` for a `MonoSpectrum`. V12 is retained as a regression test that pins the
+direction of the ratio, since a future Chromatix release could reconcile the docstring by
+changing the code rather than the docstring.
+
+**Objective pupil and camera relay.** `chromatix.functional.high_na_ff_lens` is a verified,
+documented Chromatix function, but its documented usage in the
+[High-NA vectorial PSF generation example](https://chromatix.readthedocs.io/en/latest/examples/highNA_PSF/)
+constructs the field **at the pupil** — the example builds a plane wave with a circular
+`pupil` and then applies the lens — and returns the field at the camera/focal plane. That is,
+it is documented as a pupil-to-focus operator, not as a complete sample-to-camera
+transmitted-light microscope.
 
 Using it for this brightfield path additionally requires us to specify and validate:
 
-Our own object-to-pupil mapping (how the specimen-plane field is carried to the pupil)
+* our own object-to-pupil mapping, that is, how the specimen-plane field is carried to the pupil;
+* the objective's apodisation and energy-accounting factor;
+* the camera-relay convention.
 
-The objective's apodisation/energy-conserving factor
+None of these extra choices are supplied automatically just because `high_na_ff_lens` accepts
+a vector field. Each is a **[Gate]**; see
+[Known assumptions and limitations](#known-assumptions-and-limitations).
 
-The camera-relay convention
+**[Settled] The `NA` argument of `high_na_ff_lens` is not an aperture stop.** This corrects a
+claim in the previous revision of this document. `high_na_ff_lens` does not truncate the
+incoming field: it forwards it to `cartesian_to_spherical`, whose mask
+([cartesian_to_spherical](https://chromatix.readthedocs.io/en/latest/api/field/#chromatix.core.field.cartesian_to_spherical),
+`src/chromatix/core/field.py:918-921`) is used **only** to clamp the angle,
 
-None of these extra choices are supplied automatically just because high_na_ff_lens accepts a vector field (see Known assumptions and limitations).
+```python
+pupil_radius = f * NA / n
+mask = radius_sq <= pupil_radius**2
+sin_theta2 = radius_sq * mask / f**2      # mask clamps the angle, it does not zero the field
+```
 
-As an independent defocus function does not exist in the 0.6.0 API, physical defocus will be handled via phase masking or specific propagation kernels applied around this pupil step, pending the low-NA paraxial benchmark described in Known assumptions and limitations.
+so outside the geometric pupil the field is not removed; it is propagated as if it arrived at
+normal incidence (`sin_theta = 0`, `cos_theta = 1`). Measured on the pinned tree with a
+uniform pupil field, `f = 100`, `n = 1.5`, `NA = 1.3`: the run with an explicit
+`circular_pupil` and the run without differ by a maximum relative intensity of **0.55**, and
+21.6% of the sampling grid lies outside the pupil radius. The documented example does not
+expose this because it applies `circular_pupil` itself before calling the lens.
+
+The objective aperture stop is therefore **our** responsibility and appears as an explicit
+pipeline step:
+
+```python
+field = circular_pupil(field, 2 * f_objective * objective_na / objective_immersion_refractive_index)
+```
+
+The diameter convention `w = 2 * f * NA / n` is the one Chromatix uses internally wherever it
+does apply a pupil from an `NA`
+([thin_lens](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.lenses.thin_lens),
+[ff_lens](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.lenses.ff_lens),
+[df_lens](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.lenses.df_lens);
+`src/chromatix/functional/lenses.py:58`, `:90`, `:186`), and `circular_pupil` takes a diameter,
+not a radius. `circular_pupil` itself has **no published API page** — see
+[How the documentation links in this document are constructed](#chromatix-optical-path) — so it
+is cited from `src/chromatix/functional/pupils.py:17-23` and from its only documented usage,
+the [High-NA vectorial PSF example](https://chromatix.readthedocs.io/en/latest/examples/highNA_PSF/).
+Omitting this step does not raise an error; it
+silently produces an image with no objective bandwidth limit at all, which is why it is called
+out here and tested by V7.
+
+**[Settled] `high_na_ff_lens` does not conserve energy, and its scaling depends on
+`output_dx`.** This corrects a second claim in the previous revision. The function applies
+
+```python
+defocus = jnp.where(sz != 0.0, jnp.exp(1j * k * sz * f) / sz, 0.0)   # lenses.py:145
+```
+
+and then a `zoomed_fft`, neither of which carries a Parseval-preserving normalisation.
+Measured with an explicit `circular_pupil` applied first, `f = 100`, `n = 1.5`, `NA = 1.3`,
+launched power `0.784`: the camera-plane power is `18.2` times the launched power at
+`output_dx = 0.005 um` and `72.3` times at `output_dx = 0.010 um`. The ratio is not a constant
+of the optics; it moves with the requested camera sampling.
+
+Two consequences, both load-bearing:
+
+* Absolute radiometry cannot be read off the output of this chain. A single scalar calibration
+  factor must be measured for the chosen `(f, n, NA, output_shape, output_dx)` and applied
+  before the result is called photons. This is folded into V13.
+* Any test asserting source-to-camera energy conservation must exclude `high_na_ff_lens`.
+  `ff_lens` alone *is* energy conserving: measured launched power `1.0000001` against
+  camera-plane power `1.0000001`. V7(b) is restricted accordingly.
+
+**[Settled] `high_na_ff_lens` rejects polychromatic fields.** Its docstring warns that it
+"assumes that the incoming `Field` contains only a single wavelength and has a square shape",
+and this is enforced in practice: passing a `ChromaticVectorField` of shape
+`(128, 128, 2, 3)` raises `TypeError: mul got incompatible shapes for broadcasting:
+(128, 128, 2, 3), (128, 128, 2, 2)`. Polychromatic illumination must therefore be run as a
+loop or `jax.vmap` over monochromatic `VectorField`s, one wavelength at a time, with the
+spectral weights applied to the resulting intensities. This affects the spectral half of V5
+and all of V12, and it is why `spectral_weights` is a weight over separate runs rather than a
+`Spectrum` handed to a single call.
+
+**Defocus.** No function named `defocus` exists anywhere in the pinned 0.6.0 functional API.
+This was checked against `src/chromatix/functional/lenses.py` and
+`src/chromatix/functional/phase_masks.py`, whose `__all__` lists contain no such name; the
+phase-mask module exports only `phase_change`, `interpolated_phase_change`, `wrap_phase`,
+`spectrally_modulate_phase`, `thin_prism`, `sawtooth_grating`, `sinusoid_grating` and
+`axicon`. The same absence is visible on the published
+[Lenses](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.lenses.thin_lens)
+and
+[Phase Masks](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.phase_masks.phase_change)
+sections, which render exactly those `__all__` entries. Physical defocus will therefore be handled via a defocus phase applied at the pupil
+or via a propagation kernel around the pupil step. For the second option the pinned API
+exports `transfer_propagate`, `asm_propagate`, `kernel_propagate`, `compute_asm_propagator`
+and `compute_transfer_propagator`
+([Propagation](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.propagation.asm_propagate),
+`src/chromatix/functional/propagation.py:19-31`). Which of
+the two is used is a **[Gate]** pending the low-NA paraxial benchmark described in
+[Known assumptions and limitations](#known-assumptions-and-limitations).
+
+**The local variable named `defocus` inside `high_na_ff_lens` is not a user defocus.** The
+previous revision warned that adding our own defocus would double-count against it; that
+warning was based on the variable's name and is withdrawn. The term is
+
+```python
+defocus = jnp.where(sz != 0.0, jnp.exp(1j * k * sz * f) / sz, 0.0)   # lenses.py:145
+```
+
+which is the propagation phase over the fixed focal length `f` together with the `1 / cos`
+obliquity Jacobian. It is evaluated at `z = f` and has no adjustable displacement. A user
+defocus entered at the pupil as `exp(1j * k * sz * delta_z)` therefore composes multiplicatively
+with it, `exp(1j * k * sz * (f + delta_z))`, rather than duplicating it. What *would* be a real
+double-count is applying a defocus at the pupil **and** a propagation kernel over the same
+`delta_z`; that is the case V4 guards against.
+
+Chromatix will perform the production optical propagation. It will not be used only for sensor
+noise.
 
 ## Partial-coherence model
-Each individual source point from the condenser is mutually incoherent with respect to the others. Therefore, a single source point is propagated coherently through the entire optical system to form a complex field at the camera plane. Because they are mutually incoherent, we sum their resulting intensities (not their complex fields) across all source points. Source weights are normalised so that changing the source angle or sampling does not alter the total stated illumination power; a unit-norm Jones vector fixes only the power carried by one polarisation state, so the outer sum over condenser source points must additionally use a quadrature/weighting scheme (e.g. weights that sum to a fixed total regardless of how many source points or how much of the condenser NA is sampled) to keep the total illumination power constant as sampling changes. Source-sampling convergence will be checked by increasing the number of simulated condenser source points until the final intensity image asymptotes.
-For nominally unpolarised illumination, we construct two orthogonal transverse Jones states ($\vec{E}_1$ and $\vec{E}_2$) for each oblique source direction ($\vec{k}$), verifying transversality with $\vec{k} \cdot \vec{E} = 0$. We propagate them separately through the system and average their intensities once at the detector:
-    intensity_q = 0.5 * intensity_q_1 + 0.5 * intensity_q_2
 
-We do not add the two complex fields, nor do we halve both field amplitudes.
-We construct $\vec{E}_1$ and $\vec{E}_2$ for each source direction (built from `kykx` as described in Chromatix optical path) by Gram-Schmidt orthogonalisation against a fixed lab-frame axis: a numerically stable, arbitrary transverse basis, well-defined for every condenser source direction sampled except the degenerate case where $\vec{k}$ is parallel to that reference axis. This arbitrary basis is not automatically the physical TE/TM (`s`/`p`) basis defined by the local plane of incidence at a given interface (for example the coverslip or sample boundary discussed in Known assumptions and limitations); that physical basis rotates with the source azimuth and, if interface Fresnel coefficients are introduced later, must be obtained from the arbitrary basis by an explicit rotation before those coefficients are applied. Averaging the two arbitrary-basis intensities is valid regardless of this distinction, because the averaged intensity of two orthogonal transverse states is invariant to which orthogonal basis is used; this is exactly what the Invariance to a change of transverse polarisation basis and Transverse and orthogonal polarisation states validation tests below are designed to check, rather than something we merely assert here.
+**Why one source point is propagated coherently.** Each individual source point from the
+condenser is mutually incoherent with respect to the others, but each source point is itself a
+single coherent plane wave. Therefore a single source point is propagated coherently through
+the entire optical system to form a complex field at the camera plane. Because different
+source points are mutually incoherent, their time-averaged cross terms vanish, so we sum their
+resulting intensities and not their complex fields. Summing the complex fields would impose an
+artificial fixed phase relationship between source points and would produce spurious
+interference fringes.
 
+**How source weights are normalised.** **[Proposed]** The condenser aperture is sampled at `N`
+directions `(NA_y, NA_x)_q` inside the disc `NA_y**2 + NA_x**2 <= condenser_na**2`, with
+quadrature weights `w_q` satisfying
+
+```text
+sum_q w_q = 1
+```
+
+so that the weights represent fractions of a fixed total illumination, independent of `N` and
+independent of how much of the condenser disc is sampled. With an equal-area sampling of the
+disc this reduces to `w_q = 1 / N`. The weight is applied exactly once, through the `power`
+argument of `plane_wave` as set out in [Chromatix optical path](#chromatix-optical-path), and
+is deliberately not applied a second time in the intensity sum below.
+
+Combined with the area-scaled `power`, this makes the stated illumination power invariant
+under a change of polarisation basis, source angle, source count and array padding. Those four
+invariances are exactly what V6, V8, V9 and V11 test.
+
+**Unpolarised illumination.** For nominally unpolarised illumination we construct two
+orthogonal transverse Jones states $\vec{E}_1$ and $\vec{E}_2$ for each oblique source
+direction $\vec{k}$, verifying transversality with $\vec{k} \cdot \vec{E} = 0$. We propagate
+them separately through the system and average their intensities once at the detector:
+
+```text
+intensity_q = 0.5 * intensity_q_1 + 0.5 * intensity_q_2
+```
+
+We do not add the two complex fields, nor do we halve both field amplitudes. Both runs are
+launched at the full `power` for that source point, and the factor of one half appears only
+once, in the intensity average. This is the correct representation of unpolarised light of
+power `P`: an incoherent equal mixture of two orthogonal states, which is energetically
+identical to averaging two full-power runs.
+
+The camera-plane intensity is then
+
+```text
+intensity = sum_q ( 0.5 * intensity_q_1 + 0.5 * intensity_q_2 )
+```
+
+with `w_q` already carried inside each run's `power`.
+
+**Construction of the transverse basis.** We construct $\vec{E}_1$ and $\vec{E}_2$ for each
+source direction, built from `kykx` as described in
+[Chromatix optical path](#chromatix-optical-path), by Gram-Schmidt orthogonalisation against a
+fixed lab-frame axis. This is a numerically stable, arbitrary transverse basis, well defined
+for every condenser source direction sampled except the degenerate case where $\vec{k}$ is
+parallel to that reference axis; the implementation will select the reference axis least
+aligned with $\vec{k}$ to avoid that degeneracy.
+
+Both states are three-component vectors in the Chromatix `[z, y, x]` order and, for an oblique
+$\vec{k}$, at least one of them has a nonzero `z` component of order `NA`; see
+[Chromatix optical path](#chromatix-optical-path) for the measured magnitudes. The reference
+implementation of the construction, verified to give
+$|\vec{k} \cdot \vec{E}| < 1e{-16}$ and $|\vec{E}_1 \cdot \vec{E}_2| < 1e{-17}$ at
+`(NA_y, NA_x)` of `(0, 0.6)` and `(0.3, 0.4)`, is
+
+```python
+k_zyx = np.array([np.sqrt(1 - NA_y**2 - NA_x**2), NA_y, NA_x])   # unit vector, [z, y, x]
+reference = np.array([0.0, 1.0, 0.0]) if abs(k_zyx[1]) < 0.9 else np.array([0.0, 0.0, 1.0])
+E_1 = reference - np.dot(reference, k_zyx) * k_zyx
+E_1 /= np.linalg.norm(E_1)
+E_2 = np.cross(k_zyx[::-1], E_1[::-1])[::-1]     # cross product in x, y, z order
+E_2 /= np.linalg.norm(E_2)
+```
+
+The index reversal in the cross product is not cosmetic: `np.cross` assumes a right-handed
+`[x, y, z]` ordering, and applying it directly to `[z, y, x]` arrays silently produces a
+left-handed triad. This is one of the two failure modes V8 is written to catch.
+
+This arbitrary basis is not automatically the physical TE/TM (`s`/`p`) basis defined by the
+local plane of incidence at a given interface, for example the coverslip or sample boundary
+discussed in [Known assumptions and limitations](#known-assumptions-and-limitations). That
+physical basis rotates with the source azimuth and, if interface Fresnel coefficients are
+introduced later, must be obtained from the arbitrary basis by an explicit rotation before
+those coefficients are applied. Averaging the two arbitrary-basis intensities is valid
+regardless of this distinction, because the averaged intensity of two orthogonal transverse
+states is invariant to which orthogonal basis is used. That invariance is exactly what V8 and
+V9 are designed to check, rather than something we merely assert here.
+
+**Convergence.** Source-sampling convergence will be checked by increasing the number of
+simulated condenser source points until the final intensity image asymptotes, and separately
+by increasing the number of discrete wavelength bins. The criteria and tolerances are given in
+V5.
 
 ## Sensor model
-The sensor model maps the continuous optical intensity from the simulation grid to the discrete physical pixels of the camera. The continuous intensity field is integrated over the active area of each physical pixel. In this initial design task, the sensor model only handles physical spatial resampling and scaling. Following the non-goals, the addition of realistic sensor noise (shot noise, read noise) is explicitly excluded from this step.
+
+The sensor model maps the continuous optical intensity from the simulation grid to the
+discrete physical pixels of the camera. The continuous intensity field is integrated over the
+active area of each physical pixel.
+
+**The camera-plane sample spacing is not free.** This is a correction to the previous
+revision, which computed the binning ratio purely from `objective_magnification` as if the
+field arriving at the detector were still sampled on the object-plane grid. It is not. The
+last optical step sets the spacing:
+
+* `ff_lens` **imposes** its output spacing. It delegates to `optical_fft`, which sets
+  `du = field.df * abs(lambda * z / n)`
+  ([optical_fft](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.convenience.optical_fft),
+  `src/chromatix/functional/convenience.py:33-41`),
+  that is `dx_out = lambda * f / (N * dx_in)`. Measured: `lambda = 0.532`, `N = 256`,
+  `dx_in = 0.05`, `f = 100` gives `dx_out = 4.15625 um`, and `f = 200` gives `8.31250 um`,
+  both matching the closed form exactly. There is no argument with which to request a
+  different spacing.
+* `high_na_ff_lens` **accepts** its output spacing through `output_dx` and `output_shape`, and
+  rescales the field's `dx` accordingly
+  ([high_na_ff_lens](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.lenses.high_na_ff_lens),
+  `src/chromatix/functional/lenses.py:132-156`).
+* For a polychromatic run the spacing is **per wavelength**. Measured through `ff_lens` for a
+  two-bin spectrum `[0.532, 0.650] um`: `dx_out = [0.2046, 0.2500] um`. Chromatix's own
+  `basic_sensor` warns of exactly this — "Assumes that the input has the same spacing at all
+  wavelengths!"
+  ([basic_sensor](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.sensors.basic_sensor),
+  `src/chromatix/functional/sensors.py:30-31`). Since we already run one
+  wavelength per call (see [Chromatix optical path](#chromatix-optical-path)), each run must
+  be resampled to the common camera grid **before** the spectral weights are summed, not
+  after.
+
+So the object-plane relation below is the *design target*, and the actual field spacing is
+whatever the chosen lens produced. Both must be written down and reconciled.
+
+The magnification is still needed, which is why `objective_magnification` appears in
+[Physical parameters and units](#physical-parameters-and-units). A camera pixel of pitch
+`camera_pixel_size_um` subtends, referred back to the object plane, a length
+
+```python
+camera_pixel_in_object_um = camera_pixel_size_um / objective_magnification
+```
+
+and one supersampled simulation pixel has object-plane size
+
+```python
+simulation_pixel_um = pix_mic_conv / resize_amount
+```
+
+so the number of simulation pixels binned into one camera pixel is
+
+```python
+bin_factor = camera_pixel_in_object_um / simulation_pixel_um
+```
+
+**[Proposed]** This `bin_factor` is asserted, not assumed. The implementation computes the
+achieved ratio from the field itself,
+
+```python
+achieved_bin_factor = camera_pixel_size_um / field.central_dx   # field is at the camera plane
+```
+
+and requires it to agree with `bin_factor` within a stated tolerance. A mismatch means the
+optical parameters and the sensor parameters describe different microscopes, and it must fail
+loudly rather than be silently absorbed by the resampler. This consistency assertion is part
+of V13.
+
+**[Proposed]** The resampling is an area integral, that is, a sum of intensity over the
+simulation pixels covering each camera pixel, and not a point sample. Summing rather than
+averaging is what conserves total photons under a change of `resize_amount`, which is the
+property checked by V13.
+
+Chromatix supplies both halves of this and we use them rather than writing our own:
+
+* `init_plane_resample(out_shape, out_spacing, resampling_method=...)`
+  ([init_plane_resample](https://chromatix.readthedocs.io/en/latest/api/ops/#chromatix.ops.resample.init_plane_resample),
+  `src/chromatix/ops/resample.py:77-127`). With `"pool"` it returns a
+  `PoolingPlaneDownsampler` that is literally `einops.reduce(..., "sum")`, which is the
+  integer-`bin_factor` case. With an interpolation method it returns an
+  `InterpolatingPlaneResampler` which divides by `prod(scale)` after `scale_and_translate`,
+  converting an intensity-preserving interpolation into a photon-count-preserving one; this is
+  the non-integer-`bin_factor` case.
+* **Trap, and it is silent.** The docstring says the pooling method is spelled `"pooling"`,
+  but the code tests `if resampling_method == "pool"`
+  ([init_plane_resample](https://chromatix.readthedocs.io/en/latest/api/ops/#chromatix.ops.resample.init_plane_resample),
+  `src/chromatix/ops/resample.py:122` — this is the second published-versus-implemented
+  mismatch, and the published page shows only the docstring, so the trap is invisible there).
+  Passing `"pooling"` falls through to interpolation with no error and no warning. The
+  implementation must use the literal `"pool"` and a test must assert that the returned object
+  is a `PoolingPlaneDownsampler`.
+
+**[Gate] withdrawn.** The previous revision asked whether SyMBac should constrain
+`resize_amount` so that `bin_factor` is exactly an integer, on the grounds that it would
+remove the interpolation. Chromatix already handles the non-integer case with correct photon
+accounting, so this is no longer a blocking question. Integer `bin_factor` remains
+*preferable* — `"pool"` is exact where interpolation is merely area-correct on average — so
+the implementation should emit a warning, not an error, when `bin_factor` is not an integer.
+
+In this initial design task the sensor model only handles physical spatial resampling and
+scaling. Following the non-goals, the addition of realistic sensor noise, shot noise and read
+noise, is explicitly excluded from this step. `detector_quantum_efficiency` is listed in the
+parameter table because it is needed to state the units of the output, not because any noise
+model is implemented here.
 
 ## Physical parameters and units
-| Physical quantity | Proposed code name | Value | Unit | Meaning | Source / Blocked claim if unknown |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| Vacuum wavelength | `wavelength_vacuum_um` | `unknown` | um | Wavelength in vacuum | Blocks spectral weights / phase |
-| Objective numerical aperture | `objective_na` | `unknown` | dimensionless | Light gathering ability | Blocks high-NA collection limits |
-| Condenser numerical aperture | `condenser_na` | `unknown` | dimensionless | Maximum illumination angle | Blocks partial-coherence model |
-| Sample medium refractive index | `sample_medium_refractive_index` | `unknown` | dimensionless | Refractive index of imaging medium | Blocks phase and interface scaling |
-| Cell refractive index | `cell_refractive_index` | `unknown` | dimensionless | Refractive index of cell | Blocks phase difference |
-| Coverslip refractive index | `coverslip_refractive_index` | `unknown` | dimensionless | Refractive index of coverslip | Blocks interface calculations |
-| Immersion refractive index | `immersion_refractive_index` | `unknown` | dimensionless | Refractive index of immersion | Blocks pupil mapping |
-| Simulation pixel conversion | `pix_mic_conv` | `unknown` | um | Simulation plane pixel size | Blocks physical geometric scaling |
-| Camera pixel pitch | `camera_pixel_size_um` | `unknown` | um | Physical camera sensor pixel size | Blocks detector resampling |
-| Supersampling factor | `resize_amount` | `unknown` | dimensionless | Simulation supersampling | Blocks physical scaling |
-| Physical defocus | `defocus_um` | `unknown` | um | Distance from focal plane | Blocks 3D stack generation |
-| Spectral weights | `spectral_weights` | `unknown` | dimensionless | Relative intensity of wavelengths | Blocks polychromatic imaging |
-| Optical throughput | `optical_throughput` | `unknown` | dimensionless | System transmission efficiency | Blocks absolute intensity |
-| Detector response | `detector_quantum_efficiency` | `unknown` | e-/photon | Conversion of photons to electrons | Blocks absolute physical scaling |
+
+Every value below is `unknown` unless it was read directly out of the SyMBac source tree. For
+each `unknown`, the last column states both the evidence required to fix it and the claim it
+blocks until then. No value has been copied from a Chromatix example or a paper: the two
+non-`unknown` entries are SyMBac's own defaults, and even those are marked as not yet
+confirmed to describe the microscope we are modelling.
+
+| Physical quantity | Proposed code name | Value | Unit | Meaning | Source | Evidence needed and claim blocked |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| Vacuum wavelength | `wavelength_vacuum_um` | `unknown` | um | Wavelength in vacuum | — | Needs the illumination filter or LED spectrum of the target microscope. Blocks every phase calculation and the `kykx` mapping. |
+| Spectral weights | `spectral_weights` | `unknown` | dimensionless | Relative intensity of each wavelength bin, normalised to sum to 1 | — | Needs the measured source spectrum times the camera response. Blocks polychromatic imaging and V5's spectral half. |
+| Condenser numerical aperture | `condenser_na` | `unknown` | dimensionless | Maximum illumination angle, `n * sin(theta)` | — | Needs the condenser specification and the actual aperture-diaphragm setting used. Blocks the partial-coherence model and hence all contrast predictions. |
+| Condenser source sample count | `n_condenser_source_points` | `unknown` | dimensionless (count) | Number of sampled condenser directions | — | Determined by the V5 convergence run, not by a datasheet. Blocks nothing once V5 is run; before that it blocks any claim that a result is converged. |
+| Condenser source weights | `source_weights` | `unknown` | dimensionless | Quadrature weights `w_q`, summing to 1 | — | Follows from the chosen quadrature over the condenser disc. Blocks the invariance claim in V9. |
+| Source irradiance | `source_irradiance` | `unknown` | W/um^2 (or photons/um^2/s) | Stated illumination irradiance at the specimen plane | — | Needs a power-meter measurement at the specimen plane. Blocks absolute photon counts in V13; all relative results are unaffected. |
+| Objective numerical aperture | `objective_na` | `unknown` | dimensionless | Light-gathering ability, `n * sin(theta)` | — | Needs the objective engraving or datasheet. Blocks high-NA collection limits and the validity range of V10. |
+| Objective magnification | `objective_magnification` | `unknown` | dimensionless | Object-to-camera lateral magnification | — | Needs the objective engraving plus any tube-lens or relay factor. Blocks the sensor resampling in [Sensor model](#sensor-model) entirely. |
+| Sample medium refractive index | `sample_medium_refractive_index` | `unknown` | dimensionless | Refractive index of the medium surrounding the cells | — | Needs the growth-medium composition. Blocks `refractive_index_difference` and interface scaling. |
+| Cell refractive index | `cell_refractive_index` | `unknown` | dimensionless | Refractive index of the cell cytoplasm | — | Needs a literature value for the organism, with citation. Blocks `refractive_index_difference`. |
+| Refractive-index difference | `refractive_index_difference` | `unknown` | dimensionless | `cell_refractive_index - sample_medium_refractive_index` | Derived | Blocked by the two rows above; it is the single number that sets all specimen contrast. |
+| Coverslip refractive index | `coverslip_refractive_index` | `unknown` | dimensionless | Refractive index of the coverslip glass | — | Needs the coverslip type, for example a specified borosilicate grade. Blocks the interface Fresnel calculation. |
+| Objective immersion refractive index | `objective_immersion_refractive_index` | `unknown` | dimensionless | Refractive index of the objective immersion medium | — | Needs to know whether the objective is air, water, glycerol or oil. Blocks the object-to-pupil mapping and the `n` argument of `high_na_ff_lens`. |
+| Objective focal length | `objective_focal_length_um` | `unknown` | um | Focal length passed as `f` to `high_na_ff_lens` and used to size the aperture stop | — | Follows from the tube-lens focal length divided by `objective_magnification` for an infinity-corrected objective. Blocks the aperture-stop diameter `2 * f * NA / n` and hence every collection-limited result. |
+| Tube-lens focal length | `tube_lens_focal_length_um` | `unknown` | um | Focal length passed as `f` to `ff_lens` for the camera relay | — | Needs the tube-lens specification of the microscope body. Blocks the camera-plane spacing `lambda * f / (N * dx)` and therefore the sensor binning. |
+| Camera-plane sampling | `camera_plane_dx_um`, `camera_plane_shape` | `unknown` | um, count | The `output_dx` and `output_shape` requested from `high_na_ff_lens` | — | A design choice constrained by `camera_pixel_size_um / objective_magnification` and by Nyquist at `objective_na`; not a datasheet value. Blocks the sensor consistency assertion in V13. |
+| High-NA radiometric calibration | `high_na_power_calibration` | `unknown` | dimensionless | Measured scalar correcting the non-conserving scaling of `high_na_ff_lens` | Measured, not specified | Must be re-measured whenever `(f, n, NA, output_shape, output_dx)` changes; measured values of 18.2 and 72.3 for two output spacings are recorded in [Chromatix optical path](#chromatix-optical-path). Blocks absolute photon counts in V13; relative results are unaffected. |
+| Simulation pixel conversion | `pix_mic_conv` | `0.065` (SyMBac default, applicability unconfirmed) | um per simulation pixel | Object-plane pixel size before supersampling | `SyMBac/simulation.py:42`, documented at `:107-108` | The value is SyMBac's example default, not a measurement of our microscope. Needs the real object-plane sampling. Blocks all physical geometric scaling. |
+| Supersampling factor | `resize_amount` | `3` (SyMBac default, applicability unconfirmed) | dimensionless | Simulation supersampling factor | `SyMBac/simulation.py:49`, documented at `:130-132` | Chosen for rasterisation accuracy, not measured. Needs a convergence check that the result is insensitive to it. Blocks physical scaling and the V6 padding argument. |
+| Camera pixel pitch | `camera_pixel_size_um` | `unknown` | um | Physical camera sensor pixel pitch | — | Needs the camera datasheet. Blocks detector resampling. |
+| Physical defocus | `defocus_um` | `unknown` | um | Signed distance from the focal plane | — | A swept input rather than a measured constant; needs the range used experimentally. Blocks 3D stack generation and V4. |
+| Optical throughput | `optical_throughput` | `unknown` | dimensionless | Fraction of collected light reaching the sensor | — | Needs the transmission curves of the objective, filters and tube lens. Blocks absolute intensity only; relative results are unaffected. |
+| Detector response | `detector_quantum_efficiency` | `unknown` | e-/photon | Conversion of photons to electrons | — | Needs the camera QE curve at `wavelength_vacuum_um`. Blocks absolute physical scaling in V13. |
+
+No ambiguous public names such as `n`, `scale`, `distance` or `z` are proposed. The sample
+medium, the coverslip and the objective immersion medium are kept as three separate quantities
+throughout.
 
 ## Validation tests
-For every test, we distinguish two kinds of "independent reference": (a) an external reference — a published closed-form solution or benchmark implementation, independent of this codebase, or (b) an internal analytical identity — a property (symmetry, conservation law, or exact algebraic reduction) that the stated physical model must satisfy regardless of implementation details, checked by comparing the pipeline against itself rather than against literature. Internal-identity tolerances below are set from the numerical precision of the arithmetic involved (JAX float32, accumulated over an FFT-based multi-step pipeline), not fitted to any observed output; external-benchmark tolerances that require a number from a specific paper or reference implementation we have not yet cross-checked in detail are marked "pending supervisor approval" rather than guessed.
 
-Zero refractive-index contrast
+For every test we distinguish two kinds of "independent reference": (a) an external
+reference — a published closed-form solution or benchmark implementation, independent of this
+codebase; or (b) an internal analytical identity — a property such as a symmetry, conservation
+law or exact algebraic reduction that the stated physical model must satisfy regardless of
+implementation details, checked by comparing the pipeline against itself rather than against
+literature.
 
-Independent reference: Internal analytical identity: refractive_index_difference = 0 forces phase_rad ≡ 0 and transmission ≡ 1 exactly, so the only valid comparison is the same run with the specimen step skipped.
+Internal-identity tolerances below are set from the numerical precision of the arithmetic
+involved, JAX float32 accumulated over an FFT-based multi-step pipeline, and are not fitted to
+any observed output. No tolerance in this document was chosen after seeing a result.
+External-benchmark tolerances that would require a number from a specific paper or reference
+implementation we have not yet cross-checked in detail are marked "pending supervisor
+approval" rather than guessed.
 
-Expected result: Camera-plane intensity is pixel-for-pixel identical to the specimen-free run.
+**V1 Zero refractive-index contrast**
 
-Tolerance: Max relative pixel-intensity deviation < 1e-5 (float32 round-off floor for this identity).
+* Independent reference. Internal analytical identity: `refractive_index_difference = 0`
+  forces `phase_rad` identically 0 and `transmission` identically 1, so the only valid
+  comparison is the same run with the specimen step skipped.
+* Expected result. Camera-plane intensity is pixel-for-pixel identical to the specimen-free
+  run.
+* Tolerance. Max relative pixel-intensity deviation < 1e-5, the float32 round-off floor for
+  this identity.
+* Run on a `VectorField`, not a `ScalarField`. The `thin_sample` docstring says "`ScalarField`"
+  but its implementation is `field * sample` with `sample` broadcast over the spatial
+  dimensions, so the vectorial case is the one the production path actually takes and is the
+  one that must be pinned. The test additionally asserts that all three components of
+  `[E_z, E_y, E_x]` are multiplied by the identical complex scalar; measured on the pinned tree
+  the spread across components is `1.9e-7`.
+* Failure would mean. Any excess deviation is an erroneous phase or amplitude artifact: the
+  specimen step is not correctly reducing to the identity. A nonzero spread across components
+  would mean the specimen is acting as a polariser, contradicting
+  [Physical specimen model](#physical-specimen-model).
 
-Failure would mean: Any excess deviation is an erroneous phase/amplitude artifact — the specimen step is not correctly reducing to the identity.
+**V2 A uniform sample**
 
-A uniform sample
+* Independent reference. Internal analytical identity: a spatially constant phase is a single
+  global unit-modulus factor, which cannot change the field modulus at any later plane by
+  global-phase invariance, so the intensity must match the specimen-free run.
+* Expected result. Camera-plane intensity is spatially uniform and matches the specimen-free
+  run.
+* Tolerance. Max relative pixel-intensity deviation < 1e-4. This is looser than V1 because a
+  genuine nonzero phase is actually applied through `thin_sample`, adding one more operation's
+  float32 round-off.
+* Failure would mean. Deviation indicates incorrect normalisation in `thin_sample` — or in
+  `phase_change` and `amplitude_change` if the fallback route of
+  [Chromatix optical path](#chromatix-optical-path) is in use — or a boundary or padding
+  artifact introducing spurious non-uniformity.
 
-Independent reference: Internal analytical identity: a spatially constant phase is a single global unit-modulus factor, which cannot change field modulus at any later plane (global-phase invariance), so intensity must match the specimen-free run.
+**V3 One on-axis source**
 
-Expected result: Camera-plane intensity is spatially uniform and matches the specimen-free run.
+* Independent reference. Low-NA case: the scalar Airy-disc solution, for example Born and
+  Wolf, *Principles of Optics*, valid only in the paraxial region. All NA: on-axis rotational
+  symmetry is a geometric property of the unaberrated on-axis configuration itself, an
+  internal identity needing no external reference.
+* Expected result. The PSF is circularly symmetric about the optical axis with a single
+  central lobe; at low NA it additionally matches the Airy pattern within its first two rings.
+* Tolerance. Symmetry error `max|I(r, theta) - I(r, -theta)| / max(I) < 1e-3`; low-NA only,
+  peak-normalised RMS deviation from the Airy reference < 2% within the first two Airy rings.
+  Outside that paraxial region the Airy comparison is not meaningful and is not applied.
+* **Grid caveat, required for the tolerance to be meaningful.** Chromatix builds its sampling
+  grid as `linspace(0, N - 1, N) - N / 2` (module-level `grid` helper,
+  `src/chromatix/core/field.py:29-30`; **not published** on
+  [api/field](https://chromatix.readthedocs.io/en/latest/api/field/), so this convention exists
+  only in source). For even `N`
+  this contains an exact `0`, so the pattern is centred on a pixel, but the grid runs from
+  `-N/2` to `N/2 - 1` and therefore carries one extra sample on the negative side: measured
+  for `N = 8` the extent is `[-4.0, +3.0]`. For odd `N` it is worse — measured for `N = 9` the
+  extent is `[-4.5, +3.5]`, which contains no zero at all and is not centred on any sample.
+  The test therefore uses an **even** `N` and compares only the symmetric sub-array obtained by
+  discarding the first row and the first column. Without that crop the 1e-3 tolerance cannot
+  be met by any correct implementation.
+* Failure would mean. Broken symmetry, after the crop above, indicates a source or pupil
+  misalignment or an off-centre grid. Excess Airy deviation in the low-NA case indicates an
+  error in the scalar limit of the propagation chain.
 
-Tolerance: Max relative pixel-intensity deviation < 1e-4 (looser than the zero-contrast case: a genuine nonzero phase is actually applied through phase_change, adding one more operation's float32 round-off).
+**V4 Positive and negative defocus**
 
-Failure would mean: Deviation indicates incorrect normalisation in phase_change/amplitude_change, or a boundary/padding artifact introducing spurious non-uniformity.
+* Independent reference. Internal analytical identity: for an isotropic specimen and a real,
+  non-astigmatic defocus kernel, `+defocus_um` and `-defocus_um` must produce mirror-symmetric
+  PSFs. This only checks that the implementation preserves a symmetry the design assumes; it
+  cannot by itself validate that the still-pending defocus operator is the physically correct
+  one.
+* Expected result. `I(+defocus_um)` and `I(-defocus_um)` are related by exact mirror symmetry
+  for an isotropic sample.
+* Tolerance. Max relative deviation between `I(+defocus_um)` and the mirrored
+  `I(-defocus_um)` < 1e-3. The grid caveat stated in V3 applies unchanged: the comparison is
+  made on the symmetric sub-array, since `linspace(0, N - 1, N) - N / 2` is not mirror
+  symmetric about its own centre sample.
+* Failure would mean. Asymmetry beyond tolerance indicates a sign error in the defocus phase
+  or propagation kernel, or that a pupil defocus phase and a propagation kernel were both
+  applied over the same `defocus_um`. It does **not** indicate a clash with the local variable
+  named `defocus` inside `high_na_ff_lens`: as set out in
+  [Chromatix optical path](#chromatix-optical-path) that term is the fixed-`f` propagation
+  phase and obliquity Jacobian, and it composes multiplicatively with a user defocus rather
+  than duplicating it. The previous revision's warning on that point was withdrawn.
 
-One on-axis source
+**V5 Source and spectral sampling convergence**
 
-Independent reference: Low-NA case: scalar Airy-disc solution (e.g. Born & Wolf, Principles of Optics), valid only in the paraxial region. All NA: on-axis rotational symmetry is a geometric property of the unaberrated, on-axis configuration itself (internal identity, no external reference needed).
+* Independent reference. Internal convergence criterion, a Richardson-style self-comparison at
+  increasing sampling density; no external reference.
+* Expected result. The intensity profile asymptotes to a stable result as the number of
+  simulated condenser source points, and separately the number of discrete wavelength bins,
+  increases.
+* Tolerance. For source count, the relative L2 change between successive doublings
+  `‖I_2N − I_N‖₂ / ‖I_N‖₂ < 1%`, sustained for at least one further doubling to rule out a
+  transient plateau. For spectral bins, the same criterion and the same 1% threshold applied
+  to successive doublings of the bin count.
+* Structural note on the spectral half. The wavelength bins are **separate monochromatic runs**
+  summed with `spectral_weights`, not a single `Spectrum` handed to one pipeline call, because
+  `high_na_ff_lens` raises `TypeError` on a `ChromaticVectorField`. Each run must additionally
+  be resampled onto the common camera grid before the weighted sum, since the camera-plane
+  spacing produced by `ff_lens` is wavelength dependent — measured `[0.2046, 0.2500] um` for
+  `[0.532, 0.650] um`. Summing before resampling would silently add images of different scales.
+* Failure would mean. A non-decreasing or non-monotonic change indicates condenser-aperture or
+  spectral undersampling artifacts rather than genuine convergence. A spectral result that
+  worsens with more bins, rather than converging, is the signature of the missing per-run
+  resampling described above.
 
-Expected result: PSF is circularly symmetric about the optical axis with a single central lobe; at low NA it additionally matches the Airy pattern within its first two rings.
+**V6 Padding and cropping**
 
-Tolerance: Symmetry error max abs(I(r,θ) − I(r,−θ)) / max(I) < 1e-3; low-NA-only: peak-normalised RMS deviation from the Airy reference < 2% within the first two Airy rings (outside that paraxial region the Airy comparison is not meaningful and is not applied).
+* Independent reference. Internal consistency check: the same simulation compared against
+  itself under different array padding; no external reference.
+* Expected result. Intensity within the central ROI, excluding a border of one Airy-disc
+  radius from each edge, is unaffected by the padding amount. This is the direct test of the
+  area-scaled `power` convention in [Chromatix optical path](#chromatix-optical-path): with a
+  fixed total `power` this test would fail by construction.
+* Tolerance. Max relative pixel deviation inside the central ROI < 1e-3 between the
+  minimum-padding and doubled-padding runs.
+* Failure would mean. Deviation indicates either circular-convolution wraparound, that is edge
+  aliasing contaminating the ROI, or that the launched power was not scaled with the array
+  area.
 
-Failure would mean: Broken symmetry indicates a source/pupil misalignment or an off-centre grid; excess Airy deviation (low-NA case) indicates an error in the scalar limit of the propagation chain.
+**V7 Constant incident photon scaling**
 
-Positive and negative defocus
+Note that this test deliberately does **not** assert that total power is conserved from the
+source to the camera. It cannot be, for two independent reasons, and the previous revision of
+this document stated only the first and stated it incorrectly:
 
-Independent reference: Internal analytical identity: for an isotropic specimen and a real, non-astigmatic defocus kernel, +Δz and −Δz must produce mirror-symmetric PSFs. This only checks that the implementation preserves a symmetry the design assumes — it cannot by itself validate that the still-pending defocus operator (see Known assumptions and limitations) is the physically correct one.
+1. **The objective pupil truncates.** Light the specimen diffracts beyond `objective_na` is
+   removed and never reaches the camera. The previous revision attributed that truncation to
+   the `NA` argument of `high_na_ff_lens`. That is wrong: as measured in
+   [Chromatix optical path](#chromatix-optical-path), `high_na_ff_lens` does not truncate
+   anything, and the truncation happens only because *we* apply `circular_pupil` as an
+   explicit pipeline step. The physics of the claim survives; its mechanism was misattributed.
+2. **`high_na_ff_lens` is not power preserving.** Measured camera-plane power exceeds launched
+   power by a factor of 18.2 at `output_dx = 0.005 um` and 72.3 at `output_dx = 0.010 um` for
+   an otherwise identical configuration. So even with the pupil removed entirely and no
+   specimen present, source-to-camera power equality is false by construction whenever that
+   function is in the chain.
 
-Expected result: I(+Δz) and I(−Δz) are related by exact mirror symmetry for an isotropic sample.
+The conserved property that *is* available is exact linearity in the launched power. Energy
+conservation is asserted only over the sub-chain that actually has it.
 
-Tolerance: Max relative deviation between I(+Δz) and the mirrored I(−Δz) < 1e-3.
+* Independent reference. Internal analytical identity: the entire chain from `plane_wave` to
+  `.intensity` is linear in the incident field and quadratic in its amplitude, so scaling
+  `source_irradiance` by a factor `alpha` must scale every camera-plane intensity value by
+  exactly `alpha`. This holds regardless of whether any individual step is power preserving,
+  because every step is linear in the field.
+* Expected result.
+  * (a) Scaling `source_irradiance` by `alpha` scales every camera-plane pixel by `alpha`,
+    with no change in the normalised image. This is the primary assertion and it applies to
+    the full production chain.
+  * (b) **Restricted energy conservation.** For a specimen-free, pupil-free configuration
+    built from `plane_wave` and `ff_lens` only, the total power at the output equals the total
+    launched power. Measured on the pinned tree: launched `1.0000001`, output `1.0000001`.
+    `high_na_ff_lens` is excluded from this assertion.
+  * (c) **Aperture-stop efficacy.** With a specimen-free run and an explicit
+    `circular_pupil(field, 2 * f * NA / n)`, the field is exactly zero outside the pupil
+    radius, and removing that call changes the camera-plane intensity. This is the test that
+    the aperture stop is actually present, since omitting it raises no error. Measured
+    reference for the magnitude of the effect: maximum relative intensity difference 0.55 at
+    `f = 100`, `n = 1.5`, `NA = 1.3` with 21.6% of the grid outside the pupil.
+  * (d) **Calibration stability.** `high_na_power_calibration`, defined as launched power
+    divided by camera-plane power for the specimen-free run, is recorded and asserted to be
+    unchanged for a fixed `(f, n, NA, output_shape, output_dx)`. It is not asserted to equal
+    1, and it is re-measured whenever any of those five change.
+* Tolerance. (a) Max relative deviation of `I(alpha * source_irradiance) / alpha` from
+  `I(source_irradiance)` < 1e-5, the float32 floor for a scalar multiplication. (b) Relative
+  deviation in total power < 1e-4 for the `plane_wave` plus `ff_lens` sub-chain only.
+  (c) Field amplitude outside the pupil exactly `0.0`; intensity difference against the
+  no-pupil run > 1e-2 relative, that is, unambiguously nonzero. (d) Relative change in
+  `high_na_power_calibration` between runs < 1e-4.
+* Failure would mean. Failure of (a) indicates a non-linearity, most likely an intensity clip,
+  an implicit renormalisation, or `power=None` being passed somewhere so that Chromatix does
+  not renormalise as expected. Failure of (b) indicates a normalisation bug in `optical_fft`
+  or in the source. Failure of (c) means the aperture stop was dropped from the pipeline, in
+  which case the model has no objective bandwidth limit and every resolution claim is void.
+  Failure of (d) means the calibration was measured for a different optical configuration than
+  the one being run, so all absolute photon numbers are wrong by an unknown factor.
 
-Failure would mean: Asymmetry beyond tolerance indicates a sign error in the defocus phase/propagation kernel.
+**V8 Transverse and orthogonal polarisation states**
 
-Increasing condenser-source samples
+* Independent reference. Internal consistency check: `E_1` and `E_2` are constructed unit-norm
+  and orthogonal by the Gram-Schmidt convention stated in
+  [Partial-coherence model](#partial-coherence-model), and the launched power is set
+  separately through `power`, so equal incident power follows from that construction and not
+  from external data.
+* Expected result. For every sampled source direction: `dot(k, E_1)` and `dot(k, E_2)` are
+  zero, `dot(E_1, E_2)` is zero, and the total incident power from `E_1` equals that from
+  `E_2`. Additionally, and deliberately, at least one of the two states has a **nonzero** `z`
+  component for every oblique direction; measured `|E_z|` of `0.600` at `(NA_y, NA_x)` of
+  `(0, 0.6)` and of `0.272` and `0.419` at `(0.3, 0.4)`. A construction that leaves `E_z` at
+  zero for an oblique `k` is not transverse and must fail this test rather than pass it.
+* Tolerance. Relative deviation in power < 1e-5; transversality and orthogonality residuals
+  `|dot(k, E)| / (|k| |E|) < 1e-6`, the float32 floor for the normalisation and dot-product
+  arithmetic. Measured on the pinned construction: `|dot(k, E)| < 1e-16` and
+  `|dot(E_1, E_2)| < 1e-17`. Launched powers measured equal at `1.0000001` for both states.
+* Handedness check. The test also asserts that `[E_1, E_2, k]` forms a right-handed triad. This
+  is not pedantry: `np.cross` assumes `[x, y, z]` ordering while Chromatix fields are
+  `[z, y, x]`, so a cross product taken without reversing the index order yields an orthonormal
+  but left-handed pair, which passes every dot-product assertion above and is still wrong.
+* Failure would mean. A power deviation indicates the Jones vector is being allowed to set the
+  power, contradicting the documented behaviour of the `amplitude` argument. A transversality
+  residual indicates the Gram-Schmidt construction was applied against the wrong vector or in
+  the wrong component order. A handedness failure indicates the `[z, y, x]` versus `[x, y, z]`
+  ordering was not accounted for in the cross product.
 
-Source and spectral sampling convergence:Expected: Intensity profile asymptotes to a stable result as the number of simulated condenser source points and discrete wavelength bins increases. Failure: Artifacts from undersampling the condenser aperture or the polychromatic spectrum.
+**V9 Invariance to a change of transverse polarisation basis**
 
-Independent reference: Internal convergence criterion (Richardson-style self-comparison at increasing sampling density); no external reference.
+* Independent reference. Internal consistency check: re-derive `E_1` and `E_2` from a
+  different fixed lab-frame reference axis and compare, testing the basis independence argued
+  in [Partial-coherence model](#partial-coherence-model).
+* Expected result. The averaged unpolarised intensity is identical regardless of which
+  reference axis built the orthogonal basis, excluding the degenerate case where `k` is
+  parallel to that axis.
+* Tolerance. Max relative pixel-intensity deviation between the two bases < 1e-4.
+* Failure would mean. Deviation indicates the averaging step leaks a spurious
+  polarisation-basis dependency, for example because the two runs were coherently added rather
+  than intensity-averaged.
 
-Expected result: Intensity profile asymptotes as source count increases.
+**V10 Test-only low-NA scalar comparison**
 
-Tolerance: Relative L2 change between successive doublings of source count, ‖I_2N − I_N‖₂ / ‖I_N‖₂ < 1%, sustained for at least one further doubling (to rule out a transient plateau).
+* Independent reference. External: standard scalar Fourier-optics propagation, the Fresnel or
+  angular-spectrum method, for example Goodman, *Introduction to Fourier Optics*, implemented
+  independently of the vectorial Chromatix path.
+* Expected result. At low NA the vectorial result matches the scalar FFT propagation.
+* Tolerance. Peak-normalised RMS intensity error < 1% within the stated low-NA range. The
+  exact NA cutoff — `objective_na` of roughly 0.3 is the working assumption — and the error
+  metric are **pending supervisor approval**.
+* Failure would mean. Deviation beyond tolerance, or one that grows inside rather than outside
+  the stated low-NA range, indicates a breakdown of the physical model at the paraxial limit.
+  This test cannot by itself distinguish that from a shared bug between the two
+  implementations, so it is test-only and does not certify the vectorial model at high NA.
+  That role belongs to V14.
 
-Failure would mean: Non-decreasing or non-monotonic change indicates condenser-aperture undersampling artifacts rather than genuine convergence.
+**V11 Source-direction (`kykx`) convention**
 
-Padding and cropping
+* Independent reference. Internal analytical identity: a plane wave with transverse wavevector
+  `k_t` has, by definition, a spatial period `2 * pi / |k_t|` across the field, and after a
+  Fourier-transforming lens it lands at the pupil position corresponding to
+  `NA = |k_t| * wavelength_vacuum_um / (2 * pi)`. Both are exact consequences of the stated
+  convention, independent of any Chromatix implementation detail.
+* Expected result. For a set of prescribed `(NA_y, NA_x)`, (a) the measured fringe spatial
+  frequency of the launched `VectorField` equals `NA / wavelength_vacuum_um` in cycles/um,
+  including the correct assignment of `NA_y` to the array's `y` axis and `NA_x` to its `x`
+  axis; and (b) the focal spot produced through a known pupil lands at the predicted position,
+  confirming the sign convention.
+* Tolerance. Relative error in the recovered NA < 1e-3; spot position within 1 pixel of the
+  prediction.
+* Method note. Part (a) must **not** be measured by taking the peak bin of an FFT of the
+  launched field. The frequency-bin spacing is `1 / (N * dx)`, so for a `256` grid at
+  `dx = 0.05 um` the bins are `0.078 cyc/um` apart and a correct implementation reads back
+  `0.5469` where the prediction is `0.5639` — a 3% apparent error that is pure binning. The
+  test instead fits the field directly against `exp(1j * (k_y * y + k_x * x))` on
+  `field.grid` and checks the residual. Measured this way on the pinned tree, the residual is
+  `1.2e-6` for `(NA_y, NA_x)` of `(0, 0.3)`, `(0.25, 0)` and `(0.2, -0.1)`.
+* Status. **Already passing.** The mapping was verified against the pinned source tree while
+  writing this document, so V11 is a regression guard rather than an open question. It is kept
+  because a future Chromatix release could redefine `kykx`, and because every oblique source
+  point in the partial-coherence sum depends on it.
+* Failure would mean. A factor-of-`2*pi` error, a swapped `y`/`x` order, or a sign error in
+  the `kykx` mapping. Because every oblique source point in the partial-coherence sum depends
+  on this mapping, a failure here invalidates all off-axis results, so this test must pass
+  before V5 or V9 are meaningful.
 
-Independent reference: Internal consistency check: same simulation compared against itself under different array padding; no external reference.
+**V12 Spectral phase-modulation convention**
 
-Expected result: Intensity within the central ROI (excluding a border of one Airy-disc radius from each edge) is unaffected by padding amount.
+* Independent reference. Internal analytical identity: for a non-dispersive
+  `refractive_index_difference` the specimen phase must scale exactly as
+  `1 / wavelength_vacuum_um`.
+* Status. **The direction of the ratio is no longer an open question.** It was resolved
+  statically from the pinned source: `Spectrum.spectral_modulation` returns
+  `central_wavelength / wavelength`
+  ([Spectrum.spectral_modulation](https://chromatix.readthedocs.io/en/latest/api/core/#chromatix.core.spectrum.Spectrum.spectral_modulation),
+  `src/chromatix/core/spectrum.py:97-103`), measured as
+  `[1.0000, 1.1822, 0.8185]` for `wavelength = [0.532, 0.450, 0.650] um`. The Chromatix
+  docstrings for `phase_change` and `spectrally_modulate_phase` state the reciprocal and are
+  wrong; see [Chromatix optical path](#chromatix-optical-path). V12 therefore pins behaviour
+  against regression rather than discovering a convention.
+* Expected result.
+  * (a) **Production path.** With `thin_sample` adopted as the specimen step, the applied phase
+    at each wavelength equals
+    `2 * pi * refractive_index_difference * thickness_um / wavelength_vacuum_um` exactly,
+    because `thin_sample` divides by `field.broadcasted_wavelength` internally and offers no
+    `spectrally_modulate` argument. Measured on the pinned tree for `dn = 0.05`,
+    `thickness = 1.0 um` and `wavelength = [0.532, 0.650] um`: applied `[0.59052, 0.48332] rad`
+    against analytic `[0.59052, 0.48332] rad`.
+  * (b) **Fallback path.** For the `phase_change` route, `spectrally_modulate=False` with a
+    per-wavelength `phase_rad` reproduces the same numbers, and `spectrally_modulate=True`
+    with a reference-wavelength `phase_rad` also reproduces them, because the applied factor
+    is `lambda_reference / lambda`. Both are asserted, so that a future Chromatix release which
+    "fixes" the docstring by inverting the code fails this test loudly.
+  * (c) **Monochromatic degeneracy.** For a `MonoSpectrum` the two settings differ by exactly
+    `0.0`, confirming that the choice is inert until the polychromatic stage.
+* Tolerance. Max relative phase deviation < 1e-6 for (a) and (b), the float32 floor for the
+  arithmetic; exact equality for (c).
+* Practical note. Because `high_na_ff_lens` rejects a `ChromaticVectorField` outright, this
+  test operates on the specimen step in isolation and on per-wavelength monochromatic runs.
+  It cannot be written as a single polychromatic pass through the full pipeline.
+* Failure would mean. The wavelength dependence is being applied twice or inverted, which
+  would show up as a dispersion artifact that grows with spectral bandwidth and would be
+  invisible in any monochromatic test.
 
-Tolerance: Max relative pixel deviation inside the central ROI < 1e-3 between minimum-padding and doubled-padding runs.
+**V13 Consistent physical scaling**
 
-Failure would mean: Deviation indicates circular-convolution wraparound (edge aliasing) contaminating the ROI.
+* Independent reference. Internal unit and normalisation check against the conventions stated
+  in [Physical parameters and units](#physical-parameters-and-units), specifically
+  `source_irradiance` times `optical_throughput` times `detector_quantum_efficiency`; not a
+  literature PSF comparison.
+* Expected result.
+  * (a) Camera-plane values, before any detector-noise step, are expressible as photons per
+    pixel per unit time consistent with the stated `optical_throughput`, the injected
+    `source_irradiance` **and the measured `high_na_power_calibration`**. The calibration
+    factor is not optional: as established in
+    [Chromatix optical path](#chromatix-optical-path), `high_na_ff_lens` multiplies total
+    power by an `output_dx`-dependent factor measured at 18.2 and 72.3 for two spacings, so
+    without dividing it back out the absolute photon count is wrong by more than an order of
+    magnitude. The previous revision of this document omitted this term.
+  * (b) The total is invariant to a change of `resize_amount`, which is the property that
+    confirms the sensor binning sums rather than averages.
+  * (c) **Sampling consistency.** `camera_pixel_size_um / field.central_dx` at the camera
+    plane agrees with the `bin_factor` derived from `objective_magnification` in
+    [Sensor model](#sensor-model). This is the assertion that the optical parameters and the
+    sensor parameters describe the same microscope.
+  * (d) **Resampler identity.** The object returned by `init_plane_resample` for the integer
+    case is a `PoolingPlaneDownsampler`. This guards against the silent `"pool"` versus
+    `"pooling"` spelling trap documented in [Sensor model](#sensor-model), which otherwise
+    substitutes interpolation with no error.
+* Tolerance. (a) Relative deviation between the analytically expected photon count and the
+  simulated total < 1e-4, after applying `high_na_power_calibration`. (b) Relative change
+  under a doubling of `resize_amount` < 1e-3. (c) Relative disagreement in `bin_factor`
+  < 1e-6. (d) Exact type match.
+* Failure would mean. Failure of (a) indicates the pipeline is producing non-physical, that is
+  unitless or mis-scaled, sensor counts rather than true photon-flux values, or that the
+  calibration was taken from a different optical configuration. Failure of (b) means the
+  sensor binning is averaging where it should be summing. Failure of (c) means the sensor
+  model and the optical model disagree about the magnification, which would silently rescale
+  every measured feature size. Failure of (d) means photons are being interpolated where the
+  design calls for them to be summed.
 
-Constant incident photon scaling
+**V14 Independently benchmarked vectorial propagation case**
 
-Independent reference: Physical law: conservation of energy for a lossless (non-absorbing) specimen through a lossless propagation/lens chain — an internal check grounded in a stated physical principle, not a literature PSF benchmark.
-
-Expected result: Total integrated power at the camera plane equals total power injected at the source, for the lossless specimen model defined in this document.
-
-Tolerance: Relative deviation in total power < 1e-4 (float32 accumulation floor for a nominally unitary/energy-conserving operator chain).
-
-Failure would mean: Deviation indicates a normalisation bug in a lens/propagation step (non-physical energy creation or loss).
-
-Transverse and orthogonal polarisation states
-
-Independent reference: Internal consistency check: E1/E2 are constructed unit-norm and orthogonal by the Gram-Schmidt convention stated in Chromatix optical path, so equal incident power follows from that construction, not from external data.
-
-Expected result: Total incident power from E1 equals total incident power from E2 for every sampled source direction.
-
-Tolerance: Relative deviation < 1e-5 (float32 floor for the normalisation arithmetic).
-
-Failure would mean: Deviation indicates incorrect normalisation of the Jones vectors in the Gram-Schmidt construction.
-
-Invariance to a change of transverse polarisation basis
-
-Independent reference: Internal consistency check: re-derive E1, E2 from a different fixed lab-frame reference axis and compare, testing the basis-independence argued in Chromatix optical path.
-
-Expected result: Averaged unpolarised intensity is identical regardless of which reference axis built the orthogonal basis (excluding the degenerate k-parallel-to-axis case).
-
-Tolerance: Max relative pixel-intensity deviation between the two bases < 1e-4.
-
-Failure would mean: Deviation indicates the averaging step leaks a spurious polarisation-basis dependency.
-
-Independently benchmarked vectorial propagation case
-
-Independent reference: External: Richards-Wolf-based aplanatic PSF benchmark and accompanying psf-generator reference implementation, Liu et al., arXiv:2502.03170 (or RCWA, pending supervisor approval on which is used).
-
-Expected result: Matches the Richards-Wolf-based reference solution.
-
-Tolerance: Pending supervisor approval on the exact comparison metric and accuracy the reference implementation itself reports; working default until then, peak-normalised RMS intensity error < 2%, consistent with typical PSF cross-validation tolerances in the microscopy-simulation literature, not yet confirmed against the cited paper.
-
-Failure would mean: Exceeding tolerance indicates an incorrect vectorial transfer matrix or apodisation factor in the object-to-pupil / high_na_ff_lens mapping.
-
-Test-only low-NA scalar comparison
-
-Independent reference: External: standard scalar Fourier-optics propagation (Fresnel / angular-spectrum method; e.g. Goodman, Introduction to Fourier Optics), independent of the vectorial Chromatix path.
-
-Expected result: At low NA (e.g. objective_na ≲ 0.3, pending confirmation of the exact validity boundary against the cited reference) the vectorial result matches the scalar FFT propagation.
-
-Tolerance: Peak-normalised RMS intensity error < 1% within the stated low-NA range; exact NA cutoff and error metric pending supervisor approval.
-
-Failure would mean: Deviation beyond tolerance, or one that grows outside the stated low-NA range, indicates a breakdown of the physical model at the paraxial limit. This test cannot by itself distinguish that from a shared bug between the two implementations, so it is test-only and does not certify the vectorial model at high NA — that role belongs to the independently benchmarked vectorial case above.
-
-Consistent physical scaling
-
-Independent reference: Internal unit/normalisation check against the Physical parameters and units table's own stated conventions (source photon flux × optical_throughput), not a literature PSF comparison.
-
-Expected result: Camera-plane values, before any detector-noise step, are expressible as photons/area/time consistent with the stated optical_throughput and injected source flux.
-
-Tolerance: Relative deviation between the analytically expected photon count and the simulated total < 1e-4.
-
-Failure would mean: Deviation indicates the pipeline is producing non-physical (unitless or mis-scaled) sensor counts rather than true photon-flux values.
+* Independent reference. External: a Richards-Wolf-based aplanatic PSF benchmark and its
+  accompanying `psf-generator` reference implementation, Liu et al., arXiv:2502.03170; or an
+  RCWA benchmark. Which of the two is used is **pending supervisor approval**.
+* **The cited reference is already inside the pinned tree.** Chromatix implements the
+  Richards-Wolf transfer matrix directly from that paper: the comment at
+  `src/chromatix/core/field.py:934`
+  ([cartesian_to_spherical](https://chromatix.readthedocs.io/en/latest/api/field/#chromatix.core.field.cartesian_to_spherical))
+  reads "Source: Eq. (6) of arXiv:2502.03170", and the code
+  below it is that equation term for term, written in the half-angle form
+  `[(cos + 1) + (cos - 1) * cos(2 phi)] / 2` which is algebraically identical to the textbook
+  `1 + (cos - 1) cos^2(phi)`. So the comparison against Eq. (6) can be made now and needs no
+  supervisor approval; only the choice of an *independent* reference implementation to compare
+  the full chain against does.
+* **The specific discrepancy this test must resolve.** `cartesian_to_spherical` implements the
+  transfer matrix **without** the aplanatic apodisation `sqrt(cos theta)`, and
+  `high_na_ff_lens` then applies `1 / sz`, that is `1 / cos theta`, as the Jacobian for the
+  change from angular to Cartesian pupil coordinates
+  ([high_na_ff_lens](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.lenses.high_na_ff_lens),
+  `src/chromatix/functional/lenses.py:141-145`). The aplanatic total would be
+  `sqrt(cos theta) / cos theta = 1 / sqrt(cos theta)`. Chromatix therefore weights the pupil by
+  `1 / cos theta`, which differs from the aplanatic convention by `sqrt(cos theta)`. Whether
+  the missing factor is intended to be supplied by the caller as part of the incoming pupil
+  field, or is an omission, is exactly the **[Gate]** recorded in
+  [Known assumptions and limitations](#known-assumptions-and-limitations). The test must
+  therefore compare *both* variants — with and without an explicit `sqrt(cos theta)` applied to
+  the pupil field — against the reference, and report which one matches.
+* Expected result. The vectorial camera-plane intensity matches the Richards-Wolf-based
+  reference solution for a matched configuration, for exactly one of the two apodisation
+  variants.
+* Tolerance. **Pending supervisor approval** on the exact comparison metric and on the
+  accuracy the reference implementation itself reports. The working default until then is a
+  peak-normalised RMS intensity error < 2%, which is consistent with typical PSF
+  cross-validation tolerances in the microscopy-simulation literature but has not yet been
+  confirmed against the cited paper. Note that the comparison is made on **peak-normalised**
+  intensity precisely because absolute scaling is not preserved by `high_na_ff_lens`; the
+  absolute factor is V7(d)'s business, not V14's.
+* Failure would mean. Exceeding tolerance for **both** apodisation variants indicates an
+  incorrect vectorial transfer matrix, or an error in our object-to-pupil mapping, rather than
+  a mere apodisation-convention mismatch. This is the only test in the list that can certify
+  the high-NA vectorial model.
 
 ## Proposed production files
--`SyMBac/brightfield.py`
--`tests/test_brightfield.py`
--`docs/brightfield.md`
-No additional production or test files are proposed at this stage. We propose implementing and validating this design in the following order, so that each stage is checked before the next depends on it:
-A small, self-contained vectorial propagation kernel: construct a single oblique-source `VectorField` via `kykx`, verify transversality ($\vec{k} \cdot \vec{E} = 0$), and propagate it through `high_na_ff_lens`/`ff_lens` to intensity, benchmarked against the low-NA scalar limit and, where available, the Richards-Wolf-based reference in Known assumptions and limitations. This first task is deliberately a small, independently benchmarked kernel and its test, not a complete microscope model and not a plotting script.
-The scalar specimen interaction (`thickness_um`, `phase_rad`, `transmission`) applied on top of that kernel, checked against the zero-contrast and uniform-sample limits.
-The partial-coherence sum over condenser source points, checked against the polarisation-basis-invariance and source-sampling-convergence tests.
-The sensor resampling step, checked against the padding/cropping and consistent-physical-scaling tests.
-Each stage's tests in `tests/test_brightfield.py` must pass before the next stage is added, so that a regression in an earlier stage cannot be masked by a later one.
 
+- `SyMBac/brightfield.py`
+- `tests/test_brightfield.py`
+- `docs/brightfield.md`
+
+No additional production or test files are proposed at this stage.
+
+We propose implementing and validating this design in the following order, so that each stage
+is checked before the next depends on it.
+
+1. **A small, self-contained vectorial propagation kernel.** Construct a single oblique-source
+   `VectorField` via `plane_wave(..., scalar=False)` and `kykx`, verify transversality
+   $\vec{k} \cdot \vec{E} = 0$, apply the objective aperture stop with
+   `circular_pupil(field, 2 * f * NA / n)`, and propagate through `high_na_ff_lens` and
+   `ff_lens` to intensity. Validated by V3, V8, V11, V10 and V7(b)(c)(d), and by V14 where the
+   reference is available. This first task is deliberately a small, independently benchmarked
+   kernel and its test, not a complete microscope model and not a plotting script.
+   The aperture stop belongs in this first stage rather than later, because without it the
+   kernel has no bandwidth limit and V3's Airy comparison has nothing to converge to.
+2. **The scalar specimen interaction** — `thickness_um`, `phase_rad`, `transmission` — applied
+   on top of that kernel via `thin_sample(field, absorption=0, dn=refractive_index_difference,
+   thickness=thickness_um)`. Validated by V1, V2 and V12(a).
+3. **The partial-coherence sum** over condenser source points and polarisation states.
+   Validated by V5, V9 and V7(a).
+4. **The sensor resampling step.** Validated by V6 and V13.
+
+V4 is attached to whichever stage first introduces defocus, which is a **[Gate]** decision that
+depends on the approved defocus operator. V12 splits: part (a) lands with stage 2, since it is
+a property of the specimen step alone, while parts (b) and (c) can be written immediately
+because they exercise `phase_change` and `Spectrum` in isolation. Note that the polychromatic
+pipeline cannot be a single pass — `high_na_ff_lens` rejects a `ChromaticVectorField` — so the
+spectral half of V5 is a loop over monochromatic runs and is scheduled with stage 3.
+
+Each stage's tests in `tests/test_brightfield.py` must pass before the next stage is added, so
+that a regression in an earlier stage cannot be masked by a later one.
 
 ## Chromatix dependency strategy
-The exact pinned version to be used is Chromatix 0.6.0 (release notes), the latest tagged release at the time of writing; its only change relative to 0.5.1 is documentation, so the `chromatix.readthedocs.io/en/latest` pages linked in this document describe the same public API that 0.6.0 pins. The environment will resolve via Pixi for Python 3.12.
-Proposed Pixi platforms:
--`linux-64` — primary target; JAX has full CPU and CUDA-GPU wheel support here, so this is where GPU-accelerated runs and CI are expected to run.
--`osx-arm64` — Apple Silicon; CPU-only JAX, used for local development.
--`osx-64` — best-effort/secondary, kept only as long as Pixi and JAX continue to publish wheels for it.
--`win-64` is not proposed: JAX does not publish official native-Windows wheels, so Windows users are expected to go through WSL2, which resolves as `linux-64`. This platform list is a proposal for review, not a settled decision.
-Initially, Chromatix imports will be wrapped in a try/except ImportError block so that the dependency remains optional for the default SyMBac environment.
 
+**[Settled]** The exact pinned version is Chromatix 0.6.0, the latest tagged release at the
+time of writing. Its
+[release notes](https://github.com/chromatix-team/chromatix/releases) record that it mainly
+contains tweaks to documentation relative to 0.5.1, whose own entry was a propagation bug fix,
+so the `chromatix.readthedocs.io/en/latest` pages linked in this document describe the same
+public API that 0.6.0 pins. Every signature quoted in
+[Chromatix optical path](#chromatix-optical-path) was read from that pinned source tree.
+
+**[Settled]** Chromatix imports will be wrapped in a `try` / `except ImportError` block so
+that the dependency remains optional for the default SyMBac environment, and
+`tests/test_brightfield.py` will skip rather than fail when Chromatix is absent.
+
+**Python and platforms.** The existing `pixi.toml` at the repository root already declares
+
+```toml
+platforms = ["osx-arm64", "linux-64", "win-64"]
+python = ">=3.9,<3.13"
+```
+
+Chromatix 0.6.0 declares `requires-python = ">=3.12"` in its own `pyproject.toml`, and this is
+not merely a metadata floor: the source uses `from typing import Self`
+(`src/chromatix/core/field.py:3`), which is 3.11 or newer, and `match` statements, which are
+3.10 or newer. **The intersection of the two constraints is exactly Python 3.12** — a single
+version, not a range.
+
+The previous revision said that "Python 3.12 resolves inside the current constraint and no
+change to that constraint is requested", which is true but understates the consequence. The
+consequence is:
+
+* Adding Chromatix does not widen SyMBac's supported Python range; it narrows the range on
+  which the brightfield feature can exist at all to `3.12` alone.
+* On a 3.9, 3.10 or 3.11 environment Chromatix is not installable, so the
+  `try` / `except ImportError` guard is not an edge case there — it is the *only* code path,
+  and `tests/test_brightfield.py` will skip unconditionally and permanently.
+* If SyMBac later drops to `<3.12` or Chromatix later requires `>=3.13`, the intersection
+  becomes empty and the feature becomes unbuildable without a `pixi.toml` change. Since
+  `pixi.toml` is not a file this task is permitted to change, that outcome must be raised with
+  the supervisor rather than worked around.
+
+Adding Chromatix must resolve on the three platforms **already declared**; this design does not
+propose adding or removing any platform.
+
+For the record, what each platform can do differs, and this matters for where the benchmarks
+in V10 and V14 are run rather than for whether the dependency resolves:
+
+- `linux-64` — primary target. JAX publishes both CPU and CUDA GPU wheels here, so this is
+  where GPU-accelerated runs and CI are expected to run.
+- `osx-arm64` — Apple Silicon. CPU-only JAX, used for local development.
+- `win-64` — JAX **does** publish official `jaxlib` wheels for Windows x86_64; the
+  [JAX installation page](https://docs.jax.dev/en/latest/installation.html) lists
+  "Windows, x86_64" with CPU support "yes", marked experimental. What is not available is
+  native NVIDIA GPU support on Windows, which that same table marks "no" and which requires
+  WSL2, where it resolves as `linux-64`. So `win-64` is expected to resolve for CPU-only use
+  and the correct statement is that Windows users need WSL2 for GPU, not that Windows is
+  unsupported.
+
+**[Proposed]** GPU-dependent benchmarks should therefore be marked so that they run on
+`linux-64` in CI and skip elsewhere, rather than failing on a CPU-only platform.
 
 ## Known assumptions and limitations
-Object-to-Pupil and Objective Support: Physical collection and transversality after the spatially varying sample interface remain unresolved. This acts as a supervisor gate.
-Proposal: Validate the object-to-pupil mapping, high-NA collection limits, and energy conservation (apodisation) against Richards-Wolf vectorial diffraction theory (e.g., as detailed in Novotny & Hecht, Principles of Nano-Optics) or an independent rigorous coupled-wave analysis (RCWA) benchmark.
-Interfaces: Transmission Fresnel coefficients for Sample/Coverslip/Immersion boundaries are pending validation against physical optics derivations (e.g., Novotny & Hecht) before implementation.
 
-Physical Defocus: Applying physical defocus to the high-NA vectorial field is pending validation against a low-NA paraxial limit benchmark.
+Each item below is an unresolved **[Gate]**: a defensible choice exists but the design does
+not select one, and no undocumented transform will be introduced to fill the gap merely
+because it produces a familiar-looking halo.
+
+**Object-to-pupil mapping and objective support.** `high_na_ff_lens` is documented as a
+pupil-to-focus operator, so how the specimen-plane field is carried to the objective pupil is
+not supplied by the API. *Proposal:* validate the object-to-pupil mapping against Richards-Wolf
+vectorial diffraction theory, for example as set out in Novotny and Hecht, *Principles of
+Nano-Optics*, or against an independent rigorous coupled-wave analysis (RCWA) benchmark.
+Decided by V14.
+
+Two sub-questions that the previous revision folded into this one have since been resolved and
+are no longer gates:
+
+* *The angular support* is ours to impose. `high_na_ff_lens` does not truncate; the aperture
+  stop is an explicit `circular_pupil` step in the pipeline, as measured and documented in
+  [Chromatix optical path](#chromatix-optical-path). **[Settled]**
+* *The energy accounting* is known to be non-conserving and `output_dx`-dependent, with
+  measured factors of 18.2 and 72.3. It is handled by the measured
+  `high_na_power_calibration` scalar rather than by an unresolved choice. **[Settled]**
+
+**Aplanatic apodisation.** This remains a genuine **[Gate]**, now stated precisely rather than
+generically. Chromatix's `cartesian_to_spherical` implements Eq. (6) of arXiv:2502.03170
+exactly, but without a `sqrt(cos theta)` factor, while `high_na_ff_lens` applies `1 / cos theta`
+as its coordinate Jacobian; the aplanatic convention would give `1 / sqrt(cos theta)` in total.
+So Chromatix's pupil weighting differs from the aplanatic one by `sqrt(cos theta)`. *Proposal:*
+resolve by running V14 with and without an explicit `sqrt(cos theta)` applied to the pupil
+field and reporting which variant matches the reference. Do not silently insert the factor to
+make the PSF look right; the whole point of V14 is that the choice is made by measurement.
+
+**Transversality after the spatially varying specimen.** Multiplying by a spatially varying
+$t(y, x)$ perturbs the local propagation direction, so $\vec{k} \cdot \vec{E} = 0$ no longer
+holds exactly immediately after the specimen, even though it held before it. Whether this
+residual must be projected out before the pupil, or whether it is negligible at the
+thicknesses and index contrasts SyMBac produces, is unresolved. *Proposal:* measure the
+residual $|\vec{k} \cdot \vec{E}| / (|\vec{k}| |\vec{E}|)$ directly in the angular spectrum
+after the specimen step, as a function of `refractive_index_difference` and `objective_na`,
+and compare a projected against an unprojected run. If the two agree within the V14 tolerance
+across the parameter range of interest, no projection is needed; otherwise the projection
+operator itself becomes a supervisor gate. This is a distinct question from the
+object-to-pupil mapping and needs its own measurement rather than being decided by V14 alone.
+
+**Sample, coverslip and immersion interfaces.** Transmission Fresnel coefficients for the
+sample/coverslip and coverslip/immersion boundaries are not implemented. When they are, they
+must be applied in the physical TE/TM (`s`/`p`) basis of the local plane of incidence, which
+requires an explicit rotation from the arbitrary Gram-Schmidt basis described in
+[Partial-coherence model](#partial-coherence-model). *Proposal:* derive the coefficients from
+physical optics, for example Novotny and Hecht, and verify the rotation by checking that the
+result is independent of the arbitrary starting basis, an extension of V9.
+
+**Physical defocus.** No `defocus` function exists in the pinned 0.6.0 API. Whether defocus
+enters as a pupil phase `exp(1j * k * sz * defocus_um)` or as one of the propagation kernels
+exported by `src/chromatix/functional/propagation.py`
+([Propagation](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.propagation.asm_propagate))
+is unresolved. *Proposal:* choose between
+them by benchmarking against the low-NA paraxial limit, where the defocus phase has a known
+closed form, using V4 for the sign convention and V10 for the magnitude.
+
+The previous revision added that `high_na_ff_lens` "already computes an internal defocus
+correction, so applying a second one naively would double-count". That is withdrawn: the local
+variable named `defocus` at `src/chromatix/functional/lenses.py:145`
+([high_na_ff_lens](https://chromatix.readthedocs.io/en/latest/api/functional/#chromatix.functional.lenses.high_na_ff_lens);
+the published page shows only the docstring, which does not mention this term at all) is the
+fixed-`f`
+propagation phase together with the obliquity Jacobian, evaluated at `z = f` with no adjustable
+displacement, so a user defocus composes with it rather than duplicating it. The real
+double-count risk is applying a pupil phase **and** a propagation kernel over the same
+`defocus_um`, which is what V4 actually guards.
+
+**Overlapping cells in the existing input.** As documented in
+[Existing SyMBac input](#existing-symbac-input), the rasteriser resolves overlapping projected
+cells by winner-takes-all rather than by summing thickness, so the integrated phase is
+understated wherever cells overlap. This is a property of the existing SyMBac input and is out
+of scope for this task; it is recorded here so that it is not mistaken for an optical
+modelling error when overlap regions look too bright. Changing it would mean changing
+`SyMBac/drawing.py`, which this task does not permit.

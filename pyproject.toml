@@ -37,6 +37,8 @@ dependencies = [
     "ipywidgets>=8.1.8",
     "joblib>=1.5.3",
     "scipy>=1.17.1",
+    "jax>=0.4.1; python_version >= '3.12'",
+    "chromatix @ git+https://github.com/chromatix-team/chromatix.git@0.6.0 ; python_version >= '3.12'",
     "napari[all]>=0.6.6",
     "pymunk>=7.2.0",
     "pyqtgraph>=0.13.0",

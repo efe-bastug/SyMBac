@@ -7,6 +7,12 @@ platforms = ["osx-arm64", "linux-64", "win-64"]
 python = ">=3.9,<3.13"
 pytest = ">=9.0.2,<10"
 dask = ">=2026.1.2,<2027"
+jupyterlab = ">=4,<5"
+ipykernel = ">=6,<7"
+
+[tasks]
+lab = "jupyter lab"
+examples = "jupyter lab docs/source/examples"
 
 [pypi-dependencies]
 symbac = { path = ".", editable = true }

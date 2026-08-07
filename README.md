@@ -92,13 +92,30 @@ PyTorch will use the MPS backend on Apple Silicon Macs automatically.
 pip install "git+https://github.com/georgeoshardo/SyMBac"
 ```
 
-### Jupyter widgets
+### Local checkout with Pixi
 
-Activate the Jupyter widgets extension. This is needed to interact with sliders in the notebooks to optimise images.
+For a self-contained development environment, clone the repository and let
+Pixi install SyMBac together with JupyterLab:
 
 ```sh
-jupyter nbextension enable --py widgetsnbextension
+git clone https://github.com/georgeoshardo/SyMBac.git
+cd SyMBac
+pixi install
+pixi run lab
 ```
+
+To open JupyterLab directly in the example-notebook directory, run:
+
+```sh
+pixi run examples
+```
+
+### Jupyter widgets
+
+SyMBac installs `ipywidgets` for the interactive sliders used in its notebooks.
+The Pixi environment also installs the JupyterLab widget frontend, so no manual
+extension-activation command is required when using `pixi run lab` or
+`pixi run examples`.
 
 ## Usage
 

@@ -23,11 +23,29 @@ Or to install the development version (recommended for now), run:
 
     pip install git+https://github.com/georgeoshardo/SyMBac
 
-Activate the Jupyter widgets extension. This is needed to interact with slides in the notebooks to optimise images.
+Local checkout with Pixi
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+For a self-contained development environment, clone the repository and let
+Pixi install SyMBac together with JupyterLab:
 
 .. code-block:: bash
-    
-    jupyter nbextension enable --py widgetsnbextension
+
+    git clone https://github.com/georgeoshardo/SyMBac.git
+    cd SyMBac
+    pixi install
+    pixi run lab
+
+To open JupyterLab directly in the example-notebook directory, run:
+
+.. code-block:: bash
+
+    pixi run examples
+
+SyMBac installs ``ipywidgets`` for the interactive sliders used in its
+notebooks. The Pixi environment also installs the JupyterLab widget frontend,
+so no manual extension-activation command is required when using
+``pixi run lab`` or ``pixi run examples``.
 
 If you're using a GPU
 ^^^^^^^^^^^^^^^^^^^^^
